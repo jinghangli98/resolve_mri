@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 from monai.inferers import DiffusionInferer
 from monai.networks.nets import DiffusionModelUNet
@@ -17,7 +17,9 @@ from metrics import evaluate_image_quality
 import argparse
 import wandb
 import torchvision
-from utils import shuffle_images_identically, visualize_and_save, downsample_upsample
+from utils import shuffle_images_identically, visualize_and_save, downsample_upsample, AnatomyAwareScheduler, HybridLoss
+import kornia
+import torchio as tio
 
 # Add imports for DDP
 import torch.distributed as dist
@@ -47,6 +49,11 @@ def parse_args():
                         help="Use progressive patch shuffling for training.")
     parser.add_argument("--save_model", action="store_true",
                         help="Flag to save diffusion model checkpoints.")
+    parser.add_argument("--anatomy_scheduler", action="store_true",
+                        help="Flag to use anatomy scheduler.")
+    parser.add_argument("--lpips_warmup", type=int, default=99,
+                        help="lpips_warmup")
+    parser.add_argument("--fp16", action="store_true", help="Enable FP16/mixed precision training")
     parser.add_argument("--progressive_inference", action="store_true",
                         help="Use progressive inference starting from existing images.")
     parser.add_argument("--noise_level", type=float, default=0.7,
@@ -63,7 +70,7 @@ def parse_args():
                         help="Enable wandb logging metrics.")
     parser.add_argument("--eval_num", type=int, default=1,
                         help="Number of images to evaluate per GPU (default: 1).")
-    parser.add_argument("--checkpoint_path", type=str, default="/ix3/tibrahim/jil202/cfg_gen/src/training/checkpoints/320/t1w_to_tse_model_320_ssim_8.36.pt",
+    parser.add_argument("--checkpoint_path", type=str, default="/ix3/tibrahim/jil202/cfg_gen/src/training/checkpoints/320/baseline_1.1mm_320_ssim_8.37.pt",
                         help="Path to save or load the model checkpoint (default: ./t1w_to_tse_model_448x448_DDPM_100_overfit.pt).")
     parser.add_argument("--scale_factor", type=float, default=0.5,
                         help="Scale factor for downsampling and upsampling the TSE image (default: 0.5).")
@@ -79,9 +86,9 @@ def parse_args():
                         help="URL used to set up distributed training.")
     parser.add_argument("--dist_backend", type=str, default="nccl",
                         help="Distributed backend to use (nccl, gloo, etc.).")
-    parser.add_argument("--master_addr", type=str, default="localhost",
+    parser.add_argument("--master_addr", type=str, default="127.0.0.1",
                         help="Master address for distributed training.")
-    parser.add_argument("--master_port", type=str, default="12355",
+    parser.add_argument("--master_port", type=str, default="29500",
                         help="Master port for distributed training.")
     
     # New arguments for distributed evaluation
@@ -93,6 +100,20 @@ def parse_args():
     # Parse arguments
     args = parser.parse_args()
     return args
+
+def get_anatomy_mask(t1w, sigma=1.0, edge_threshold=0.1):
+    """Generate noise scaling mask based on T1w edges."""
+    # Convert to grayscale if needed
+    if t1w.shape[1] > 1:
+        t1w = kornia.color.rgb_to_grayscale(t1w)
+    
+    # Sobel edges (gradient magnitude)
+    edges = kornia.filters.sobel(t1w).mean(dim=1, keepdim=True)  # [B,1,H,W]
+    
+    # Normalize and threshold
+    edges = (edges - edges.min()) / (edges.max() - edges.min())
+    mask = torch.where(edges > edge_threshold, 0.5, 1.5)  # Less noise near edges
+    return mask
 
 def print_gpu_memory_report():
     if torch.cuda.is_available():
@@ -136,6 +157,8 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 def train(local_rank, args):
+    torch.set_float32_matmul_precision('high')
+
     """Main training function that handles distributed training"""
     # Ensure distributed setup if needed
     if args.distributed:
@@ -240,7 +263,7 @@ def train(local_rank, args):
         model.load_state_dict(state_dict)
     
     model.to(device)
-    
+    model = torch.compile(model)
     # Wrap model with DDP
     if args.distributed:
         if local_rank == 0:
@@ -250,7 +273,10 @@ def train(local_rank, args):
             dist.barrier()
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
-    scheduler = DDPMScheduler(num_train_timesteps=1000)
+    if args.anatomy_scheduler:        
+        scheduler = AnatomyAwareScheduler(num_train_timesteps=1000)
+    else:
+        scheduler = DDPMScheduler(num_train_timesteps=1000)
     optimizer = torch.optim.Adam(params=model.parameters(), lr=args.lr)
     inferer = DiffusionInferer(scheduler)
 
@@ -265,7 +291,9 @@ def train(local_rank, args):
     
     if local_rank == 0:
         print("Starting training loop")
-        
+    
+    loss_fn = HybridLoss(device=device)
+
     for epoch in range(args.max_epochs):
         # Set epoch for distributed sampler
         if args.distributed:
@@ -282,7 +310,7 @@ def train(local_rank, args):
 
         for _step, (t1w, tse) in progress_bar:
             t1w, tse = t1w.to(device).unsqueeze(1), tse.to(device).unsqueeze(1) #t1 is the low resolution image
-            t1w = downsample_upsample(t1w, scale_factor=args.scale_factor, mode='bilinear')
+            t1w = downsample_upsample(t1w, scale_factor=args.scale_factor, mode='bilinear')     
             if args.progressive:
                 if epoch >= 0 and epoch < 40:
                     t1w, tse = shuffle_images_identically(t1w, tse, num_patches=2)
@@ -303,12 +331,23 @@ def train(local_rank, args):
             optimizer.zero_grad(set_to_none=True)
             timesteps = torch.randint(0, 1000, (t1w.shape[0],)).to(device)
 
-            with autocast(enabled=True):
+            with autocast(device_type='cuda', enabled=args.fp16):
                 noise = torch.randn_like(tse).to(device)
-                noisy_tse = scheduler.add_noise(original_samples=tse, noise=noise, timesteps=timesteps)
+
+                if args.anatomy_scheduler:
+                    anatomy_mask = get_anatomy_mask(t1w)  # [B,1,H,W]
+                    noisy_tse = scheduler.add_noise(original_samples=tse, noise=noise, timesteps=timesteps, anatomy_mask=anatomy_mask)
+                else:
+                    noisy_tse = scheduler.add_noise(original_samples=tse, noise=noise, timesteps=timesteps)
+                
                 combined = torch.cat((t1w, noisy_tse), dim=1)
                 prediction = model(x=combined, timesteps=timesteps)
-                loss = F.mse_loss(prediction.float(), noise.float())
+
+                if epoch > args.lpips_warmup:
+                    loss = loss_fn(prediction, noise, lambda_lpips=0.1)
+                else:
+                    loss = F.mse_loss(prediction.float(), noise.float()) 
+                    
             
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -388,12 +427,13 @@ def train(local_rank, args):
             if local_rank == 0 and ssim_psnr > best_ssim_psnr:
                 best_ssim_psnr = ssim_psnr
                 best_ssim = ssim
-                checkpoint_path = f"./checkpoints/{args.resize_size}/{args.scale_factor}/t1w_to_tse_model_{args.resize_size}_ssim_{best_ssim_psnr:.2f}.pt"
-                
+                checkpoint_path = f"./checkpoints/{args.resize_size}/{args.scale_factor}/histogram_loss_{args.histogram_loss}_anatomy_scheduler_{args.anatomy_scheduler}_lpips_{args.lpips_warmup}_{args.resize_size}_ssim_{best_ssim_psnr:.2f}.pt"
                 # Save the model state dict (unwrap DDP model if needed)
                 if args.save_model:
                     if args.distributed:
                         torch.save(model.module.state_dict(), checkpoint_path)
+                        if epoch == args.max_epochs - 1:
+                            torch.save(model.module.state_dict(), 'final_model.pt')
                     else:
                         torch.save(model.state_dict(), checkpoint_path)
                     

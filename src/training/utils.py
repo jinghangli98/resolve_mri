@@ -11,7 +11,44 @@ import torch.distributed as dist
 import wandb
 import os
 import torch.nn.functional as F
+from monai.networks.schedulers import DDPMScheduler
+import torch.nn as nn
+import lpips
 
+class AnatomyAwareScheduler(DDPMScheduler):
+    def __init__(self, num_train_timesteps=1000, **kwargs):
+        # Initialize parent (DDPMScheduler) with standard parameters
+        super().__init__(num_train_timesteps=num_train_timesteps, **kwargs)
+    
+    def add_noise(self, original_samples, noise, timesteps, anatomy_mask=None):
+        # Standard noise addition from parent
+        noisy_samples = super().add_noise(original_samples, noise, timesteps)
+        
+        # Anatomy-aware adjustment
+        if anatomy_mask is not None:
+            # Ensure mask is same shape as noise
+            anatomy_mask = anatomy_mask.expand_as(noisy_samples)
+            # Scale noise by mask (low values near edges reduce noise)
+            noisy_samples = original_samples + (noisy_samples - original_samples) * anatomy_mask
+        
+        return noisy_samples
+
+class HybridLoss(nn.Module):
+    def __init__(self, device="cuda"):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.lpips = lpips.LPIPS(net='alex').to(device).eval()
+        
+    def forward(self, pred, target, lambda_lpips=0.1):
+        loss_mse = self.mse(pred, target)
+        if lambda_lpips > 0:
+            # LPIPS expects [-1,1] range
+            pred_norm = (pred - pred.min()) / (pred.max() - pred.min()) * 2 - 1
+            target_norm = (target - target.min()) / (target.max() - target.min()) * 2 - 1
+            loss_lpips = self.lpips(pred_norm, target_norm).mean()
+            return loss_mse + lambda_lpips * loss_lpips
+        return loss_mse
+        
 def norm(img):
     """Normalize the image to 0-255 range."""
     img = img.float()  # Ensure we're working with float tensor
@@ -148,7 +185,10 @@ def visualize_and_save(epoch, model, device, scheduler, t1w, tse, args, local_ra
                 vis = Image.fromarray(vis)
                 
                 # Save the visualization to disk
-                vis_path = f"visualization_results/{args.scale_factor}/epoch_{epoch+1}_rank_{local_rank}_idx_{ind}.png"
+                if args.lpips_warmup:
+                    vis_path = f"visualization_results/{args.scale_factor}/anatomy_scheduler_{args.anatomy_scheduler}_lpips_{args.lpips_warmup}_epoch_{epoch+1}_rank_{local_rank}_idx_{ind}.png"
+                else:
+                    vis_path = f"visualization_results/{args.scale_factor}/anatomy_scheduler_{args.anatomy_scheduler}_epoch_{epoch+1}_rank_{local_rank}_idx_{ind}.png"
                 vis.save(vis_path)
                 
                 # Store the generated image for potential wandb logging

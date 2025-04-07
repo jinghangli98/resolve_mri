@@ -1,5 +1,4 @@
 import os
-import time
 import torch
 import math
 import numpy as np
@@ -10,6 +9,13 @@ import nibabel as nib
 import torchio as tio
 from tqdm import tqdm
 from torch.amp import autocast
+import pdb
+from utils import downsample_upsample
+from metrics import evaluate_image_quality
+import xformers
+import xformers.ops
+from torch.cuda.amp import GradScaler, autocast
+import torchvision
 
 def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int, max_period: int = 10000) -> torch.Tensor:
     """
@@ -175,8 +181,8 @@ class MonaiDeepCache:
         self.cached_features = {}
         self.step_counter = 0
 
-def load_model(checkpoint_path, device="cuda"):
-    """Load the pretrained diffusion model"""
+def load_model(checkpoint_path, device="cuda", use_xformers=True, use_half=True):
+    """Load the pretrained diffusion model with xformers and half precision support"""
     model = DiffusionModelUNet(
         spatial_dims=2,
         in_channels=2,  # T1w + noise
@@ -193,7 +199,25 @@ def load_model(checkpoint_path, device="cuda"):
     model.load_state_dict(state_dict)
     model.eval()
     
+    # Enable xformers efficient attention if requested
+    if use_xformers:
+        replace_unet_attention_with_xformers(model)
+    
+    # Convert to half precision if requested
+    if use_half:
+        model = model.half()
+    
     return model
+
+def replace_unet_attention_with_xformers(unet):
+    """Replace the attention mechanism in UNet with xformers for memory efficiency"""
+    # Find all attention modules in the model
+    for name, module in unet.named_modules():
+        # Look for attention modules - adjust the class name based on MONAI's implementation
+        if "SelfAttention" in module.__class__.__name__ or "CrossAttention" in module.__class__.__name__:
+            # Replace the attention operation with xformers efficient attention
+            module.set_use_memory_efficient_attention_xformers(True)
+            print(f"Replaced attention mechanism in {name} with xformers")
 
 def quantile_normalization(input_nii, lower_quantile=0.05, upper_quantile=0.95):
     """
@@ -222,15 +246,18 @@ def quantile_normalization(input_nii, lower_quantile=0.05, upper_quantile=0.95):
 
     return data_normalized
 
-def vanilla_inference(model, device, scheduler, t1w, progressive_inference=False, noise_level=0.7):
+def vanilla_inference(model, device, scheduler, t1w, progressive_inference=False, noise_level=0.7, use_half=True):
     """
-    Standard inference without DeepCache optimization.
+    Standard inference without DeepCache optimization but with half precision.
     """
     model.eval()
     
     with torch.no_grad():
         # Setup
         input_img = t1w
+        if use_half:
+            input_img = input_img.half()
+            
         scheduler.set_timesteps(num_inference_steps=1000)
 
         if progressive_inference:
@@ -238,9 +265,15 @@ def vanilla_inference(model, device, scheduler, t1w, progressive_inference=False
             noise_timestep = int(noise_level * len(scheduler.timesteps))
             noise_timestep = max(min(noise_timestep, len(scheduler.timesteps)-1), 0)
             noise = torch.randn_like(current_img, device=device)
+            if use_half:
+                noise = noise.half()
+                
             t = scheduler.timesteps[noise_timestep]
 
             alpha_cumprod = scheduler.alphas_cumprod.to(device)
+            if use_half:
+                alpha_cumprod = alpha_cumprod.half()
+                
             sqrt_alpha_t = alpha_cumprod[t] ** 0.5
             sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
             current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
@@ -249,22 +282,27 @@ def vanilla_inference(model, device, scheduler, t1w, progressive_inference=False
             timesteps = scheduler.timesteps[starting_timestep_idx:]
         else:
             noise = torch.randn_like(input_img).to(device)
+            if use_half:
+                noise = noise.half()
+                
             current_img = noise  # for the TSE image, we start from random noise.
             timesteps = scheduler.timesteps
 
         progress_bar = tqdm(timesteps, desc="Vanilla Inferencing")
 
         for t in progress_bar:  # go through the noising process
-            with autocast("cuda", enabled=False):
+            with torch.autocast(device_type="cuda",  dtype=torch.float16, enabled=use_half):
                 combined = torch.cat((input_img, current_img), dim=1)
                 model_output = model(combined, timesteps=torch.Tensor((t,)).to(current_img.device))
                 current_img, _ = scheduler.step(model_output, t, current_img)
+                
                     
         return current_img
 
-def deepcache_inference(model, device, scheduler, t1w, cache_interval=5, cache_branch_id=0, progressive_inference=False, noise_level=0.7):
+def deepcache_inference(model, device, scheduler, t1w, cache_interval=5, cache_branch_id=0, 
+                        progressive_inference=False, noise_level=0.7, use_half=True):
     """
-    Run inference with DeepCache optimization for faster generation.
+    Run inference with DeepCache optimization for faster generation with half precision.
     
     Args:
         model: The diffusion model
@@ -275,6 +313,7 @@ def deepcache_inference(model, device, scheduler, t1w, cache_interval=5, cache_b
         cache_branch_id: Which branch to use for caching (0=shallowest, higher=deeper)
         progressive_inference: Whether to use progressive inference
         noise_level: Progressive inference noise level (0.0 to 1.0)
+        use_half: Whether to use half precision (FP16)
     
     Returns:
         Generated image
@@ -289,6 +328,9 @@ def deepcache_inference(model, device, scheduler, t1w, cache_interval=5, cache_b
         with torch.no_grad():
             # Setup
             input_img = t1w
+            if use_half:
+                input_img = input_img.half()
+                
             scheduler.set_timesteps(num_inference_steps=1000)
             
             # Initial setup for progressive inference if enabled
@@ -297,9 +339,15 @@ def deepcache_inference(model, device, scheduler, t1w, cache_interval=5, cache_b
                 noise_timestep = int(noise_level * len(scheduler.timesteps))
                 noise_timestep = max(min(noise_timestep, len(scheduler.timesteps)-1), 0)
                 noise = torch.randn_like(current_img, device=device)
+                if use_half:
+                    noise = noise.half()
+                    
                 t = scheduler.timesteps[noise_timestep]
 
                 alpha_cumprod = scheduler.alphas_cumprod.to(device)
+                if use_half:
+                    alpha_cumprod = alpha_cumprod.half()
+                    
                 sqrt_alpha_t = alpha_cumprod[t] ** 0.5
                 sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
                 current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
@@ -308,6 +356,9 @@ def deepcache_inference(model, device, scheduler, t1w, cache_interval=5, cache_b
                 timesteps = scheduler.timesteps[starting_timestep_idx:]
             else:
                 noise = torch.randn_like(input_img).to(device)
+                if use_half:
+                    noise = noise.half()
+                    
                 current_img = noise  # for the TSE image, we start from random noise
                 timesteps = scheduler.timesteps
             
@@ -320,11 +371,11 @@ def deepcache_inference(model, device, scheduler, t1w, cache_interval=5, cache_b
                 
                 # Update progress bar with mode
                 if deepcache.step_counter % cache_interval == 0:
-                    progress_bar.set_postfix({"mode": "full"})
+                    progress_bar.set_postfix({"mode": "full  "})
                 else:
                     progress_bar.set_postfix({"mode": "cached"})
                     
-                with autocast("cuda", enabled=False):
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_half):
                     # Combine input and current noisy image
                     combined = torch.cat((input_img, current_img), dim=1)
                     
@@ -338,6 +389,7 @@ def deepcache_inference(model, device, scheduler, t1w, cache_interval=5, cache_b
     finally:
         # Always restore the original model
         deepcache.disable()
+
 
 def non_uniform_deepcache_inference(model, device, scheduler, t1w, 
                                    center_timestep=400, power=1.2, cache_branch_id=0,
@@ -422,7 +474,7 @@ def non_uniform_deepcache_inference(model, device, scheduler, t1w,
                 else:
                     progress_bar.set_postfix({"mode": "cached"})
                 
-                with autocast("cuda", enabled=False):
+                with autocast("cuda", enabled=True):
                     combined = torch.cat((input_img, current_img), dim=1)
                     
                     # Run the model with DeepCache
@@ -436,156 +488,77 @@ def non_uniform_deepcache_inference(model, device, scheduler, t1w,
         # Always restore the original model
         deepcache.disable()
 
-def benchmark_inference(model, device, scheduler, t1w, 
-                        cache_intervals=[1, 2, 5, 10, 20], 
-                        branch_ids=[0, 1, 2]):
-    """
-    Benchmark the inference speed and quality with different configurations.
-    
-    Args:
-        model: The diffusion model
-        device: Device to run inference on
-        scheduler: Diffusion scheduler
-        t1w: Input image
-        cache_intervals: List of cache intervals to test
-        branch_ids: List of branch IDs to test
-        
-    Returns:
-        dict: Results including timing and outputs for each method
-    """
-    results = {
-        'vanilla': {'time': None, 'output': None},
-    }
-    
-    for interval in cache_intervals:
-        for branch_id in branch_ids:
-            config_name = f'deepcache_N{interval}_B{branch_id}'
-            results[config_name] = {'time': None, 'output': None}
-    
-    # Test vanilla inference
-    print("Running vanilla inference...")
-    start_time = time.time()
-    vanilla_output = vanilla_inference(model, device, scheduler, t1w)
-    vanilla_time = time.time() - start_time
-    results['vanilla']['time'] = vanilla_time
-    results['vanilla']['output'] = vanilla_output
-    print(f"Vanilla inference time: {vanilla_time:.2f}s")
-    
-    # Test DeepCache with different configurations
-    for interval in cache_intervals:
-        for branch_id in branch_ids:
-            config_name = f'deepcache_N{interval}_B{branch_id}'
-            print(f"Running DeepCache with interval={interval}, branch_id={branch_id}...")
-            
-            start_time = time.time()
-            cache_output = non_uniform_deepcache_inference(
-                model, device, scheduler, t1w, 
-                cache_interval=interval, 
-                cache_branch_id=branch_id,
-            )
-            cache_time = time.time() - start_time
-            speedup = vanilla_time / cache_time
-            
-            results[config_name]['time'] = cache_time
-            results[config_name]['output'] = cache_output
-            
-            print(f"DeepCache (N={interval}, B={branch_id}): {cache_time:.2f}s, Speedup: {speedup:.2f}×")
-    
-    return results
-
 def main():
+    import time
     # Configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_path = "/ix3/tibrahim/jil202/cfg_gen/src/training/checkpoints/320/t1w_to_tse_model_320_ssim_8.36.pt"
+    checkpoint_path = "/ix3/tibrahim/jil202/cfg_gen/src/training/checkpoints/320/0.5/anatomy_scheduler_False_lpips_1_320_ssim_8.46.pt" # 
     
     # DeepCache parameters to test
-    cache_interval = 5    # N value - higher means more speedup but potentially lower quality
+    cache_interval = 20    # N value - higher means more speedup but potentially lower quality
     cache_branch_id = 0   # Branch ID - 0=shallowest (fastest), higher=deeper (better quality)
     
-    # Load model
-    print("Loading model...")
-    model = load_model(checkpoint_path, device)
+    # Performance optimization settings
+    use_xformers = True   # Enable xformers for memory-efficient attention
+    use_half = True  # Enable half precision (FP16)
+    
+    # Load model with optimizations
+    print("Loading model with xformers and half precision...")
+    model = load_model(checkpoint_path, device, use_xformers=use_xformers, use_half=use_half)
     model.eval()
     
     # Load and preprocess example input (single slice for benchmarking)
     input_nii = nib.load('/ix3/tibrahim/jil202/cfg_gen/qc_image_nii/denoised_mp2rage/IBRA-BIO1/PRT170058/converted/MP2RAGE_UNI_Images/md_denoised_PRT170058_20180912172034.nii.gz')
-    input_nii = tio.transforms.Resample((1,1,1))(input_nii)
-    input_nii = tio.transforms.Resample((0.55,0.55,0.55))(input_nii)
-    input_nii = tio.transforms.CropOrPad((300,360,384))(input_nii)
+    input_nii = tio.transforms.CropOrPad((384,384,384))(input_nii)
     data = quantile_normalization(input_nii, lower_quantile=0.01, upper_quantile=0.99)
     data = torch.tensor(data).to(device)
     
     # Select a single slice for testing
-    test_slice = torch.rot90(data[:,:,190], 1).unsqueeze(0).unsqueeze(0).float().to(device)
+    test_slice = torch.rot90(data[120,:,:], 1).unsqueeze(0).unsqueeze(0).float().to(device)
+    input_slice = downsample_upsample(test_slice, scale_factor=0.5, mode='bilinear')
     
     # Initialize scheduler
     scheduler = DDPMScheduler(num_train_timesteps=1000)
+
+    # Run benchmarks with optimizations
+    print("\n--- Running inference benchmarks with xformers and half precision ---")
     
-    # Run benchmark with more configurations
-    print("\nRunning comprehensive benchmark...")
-    benchmark_results = benchmark_inference(
-        model, device, scheduler, test_slice, 
-        cache_intervals=[20],
-        branch_ids=[0]  # Test with first and second branch
-    )
+    # Vanilla inference with optimizations
+    start_time = time.time()
+    vanilla_output = vanilla_inference(model, device, scheduler, input_slice, 
+                                       progressive_inference=True, noise_level=0.7, use_half=use_half)
+    vanilla_time = time.time() - start_time
+    print(f"Vanilla inference time: {vanilla_time:.2f} seconds")
     
-    # Save visual comparison of results
-    plt.figure(figsize=(20, 15))
-    plt.subplot(3, 4, 1)
-    plt.imshow(test_slice.squeeze().cpu(), cmap='gray')
-    plt.title("Input")
+    # DeepCache inference with optimizations
+    start_time = time.time()
+    deepcache_outputs = []
+    for _ in range(5):
+        cache_output = deepcache_inference(model, device, scheduler, input_slice, 
+                                        cache_interval=cache_interval, cache_branch_id=cache_branch_id,
+                                        use_half=use_half, progressive_inference=True, noise_level=0.7)
+        deepcache_outputs.append(cache_output)
+    cache_time = time.time() - start_time
+    print(f"DeepCache inference time: {cache_time:.2f} seconds")
+    print(f"Speedup: {vanilla_time / cache_time:.2f}x")
+
+    cache_output = torch.stack(deepcache_outputs).squeeze().mean(0)
+    # Compare image quality
+
+    # ssim_input, psnr, lpips = evaluate_image_quality(torch.clamp(input_slice.squeeze(), 0, 1).detach().cpu().numpy(), test_slice.squeeze().detach().cpu().numpy())
+    vanilla_metrics = evaluate_image_quality(torch.clamp(vanilla_output.squeeze(), 0, 1).detach().cpu().numpy(), test_slice.squeeze().detach().cpu().numpy())
+    ssim_vanilla, psnr_vanilla, lpips_vanilla = vanilla_metrics['SSIM'], vanilla_metrics['PSNR'], vanilla_metrics['LPIPS']
+    cached_metrics = evaluate_image_quality(torch.clamp(cache_output.squeeze(), 0, 1).detach().cpu().numpy(), test_slice.squeeze().detach().cpu().numpy())
+    ssim_cached, psnr_cached, lpips_cached = cached_metrics['SSIM'], cached_metrics['PSNR'], cached_metrics['LPIPS']
+    print(f"Quality comparison - Vanilla: PSNR: {psnr_vanilla:.2f} dB, SSIM: {ssim_vanilla:.4f}, LPIPS: {lpips_vanilla:.4f}")
+    torchvision.utils.save_image(torch.hstack((torch.clamp(input_slice.squeeze(), 0, 1).detach().cpu(), 
+                                               torch.clamp(vanilla_output.squeeze(), 0, 1).detach().cpu(), 
+                                               test_slice.squeeze().detach().cpu())), f'vanilla_inference_use_xformers_{use_xformers}_half_precision_{use_half}.png')
     
-    plt.subplot(3, 4, 2)
-    plt.imshow(benchmark_results['vanilla']['output'].squeeze().cpu(), cmap='gray')
-    plt.title(f"Vanilla ({benchmark_results['vanilla']['time']:.2f}s)")
-    
-    # Plot branch 0 results
-    row, col = 0, 0
-    for interval in [20]:
-        config_name = f'deepcache_N{interval}_B0'
-        if config_name in benchmark_results:
-            row += 1
-            plt.subplot(3, 4, 4 + row)
-            plt.imshow(benchmark_results[config_name]['output'].squeeze().cpu(), cmap='gray')
-            result_time = benchmark_results[config_name]['time']
-            speedup = benchmark_results['vanilla']['time'] / result_time
-            plt.title(f"B0, N={interval}\n({result_time:.2f}s, {speedup:.2f}×)")
-    
-    # Plot branch 1 results
-    row, col = 0, 0
-    for interval in [20]:
-        config_name = f'deepcache_N{interval}_B1'
-        if config_name in benchmark_results:
-            row += 1
-            plt.subplot(3, 4, 8 + row)
-            plt.imshow(benchmark_results[config_name]['output'].squeeze().cpu(), cmap='gray')
-            result_time = benchmark_results[config_name]['time']
-            speedup = benchmark_results['vanilla']['time'] / result_time
-            plt.title(f"B1, N={interval}\n({result_time:.2f}s, {speedup:.2f}×)")
-    
-    plt.tight_layout()
-    plt.savefig("deepcache_benchmark_comparison.png")
-    plt.close()
-    
-    # Print benchmark summary
-    print("\nBenchmark Summary:")
-    print(f"Vanilla: {benchmark_results['vanilla']['time']:.2f}s")
-    
-    # Print results sorted by speedup
-    results_list = []
-    for config, metrics in benchmark_results.items():
-        if config != 'vanilla':
-            speedup = benchmark_results['vanilla']['time'] / metrics['time']
-            results_list.append((config, metrics['time'], speedup))
-    
-    # Sort by speedup (descending)
-    results_list.sort(key=lambda x: x[2], reverse=True)
-    
-    print("\nConfigurations ranked by speedup:")
-    for config, time, speedup in results_list:
-        print(f"{config}: {time:.2f}s, Speedup: {speedup:.2f}×")
-    
-    print("\nDeepCache benchmark completed!")
+    print(f"Quality comparison - Cached: PSNR: {psnr_cached:.2f} dB, SSIM: {ssim_cached:.4f}, LPIPS: {lpips_cached:.4f}")
+    torchvision.utils.save_image(torch.hstack((torch.clamp(input_slice.squeeze(), 0, 1).detach().cpu(), 
+                                               torch.clamp(cache_output.squeeze(), 0, 1).detach().cpu(), 
+                                               test_slice.squeeze().detach().cpu())), f'Cached_inference_use_xformers_{use_xformers}_half_precision_{use_half}.png')
 
 if __name__ == "__main__":
     main()

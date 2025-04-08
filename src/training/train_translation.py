@@ -427,7 +427,7 @@ def train(local_rank, args):
             if local_rank == 0 and ssim_psnr > best_ssim_psnr:
                 best_ssim_psnr = ssim_psnr
                 best_ssim = ssim
-                checkpoint_path = f"./checkpoints/{args.resize_size}/{args.scale_factor}/histogram_loss_{args.histogram_loss}_anatomy_scheduler_{args.anatomy_scheduler}_lpips_{args.lpips_warmup}_{args.resize_size}_ssim_{best_ssim_psnr:.2f}.pt"
+                checkpoint_path = f"./checkpoints/{args.resize_size}/{args.scale_factor}/anatomy_scheduler_{args.anatomy_scheduler}_lpips_{args.lpips_warmup}_{args.resize_size}_ssim_{best_ssim_psnr:.2f}.pt"
                 # Save the model state dict (unwrap DDP model if needed)
                 if args.save_model:
                     if args.distributed:

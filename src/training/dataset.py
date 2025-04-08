@@ -50,7 +50,6 @@ def get_dataset(data_root, crop_size, size, sample=1, type='img', split_ratio=0.
     random_effects = {
         tio.transforms.RandomBiasField(0.3, 3): 0.1,
         tio.transforms.RandomGhosting(intensity=(0.1, 0.5)): 0.1,
-        tio.Lambda(lambda x: x): 0.0
     }
     
     transform = tio.Compose([

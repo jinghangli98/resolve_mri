@@ -1059,14 +1059,14 @@ def patch_inference(model, device, scheduler, t1w, patch_size=128, base_overlap=
         image = t1w[0, 0].cpu().numpy()  # Use first channel for information map
         
         # Get adaptive patch positions
-        positions, _ = adaptive_patch_locations(
+        positions, overlap_map = adaptive_patch_locations(
             image, 
             patch_size=patch_size, 
             base_overlap=base_overlap, 
             intensity_scale=intensity_scale,
             target_patches=target_patches
         )
-       
+        plot_patch_heatmap(image, positions, overlap_map)
         # Extract patches based on adaptive positions
         patches = []
         for y, x in positions:
@@ -1643,8 +1643,8 @@ def main():
     patch_num = (image_size//patch_size) ** 2
     additional_patches = target_patches - patch_num
     base_overlap = 32
-    batch_size = 24
-    inference_step = 20
+    batch_size = 1
+    inference_step = 100
     # Performance optimization settings
     use_xformers = True   # Enable xformers for memory-efficient attention
     use_half = True  # Enable half precision (FP16)
@@ -1659,10 +1659,10 @@ def main():
     # Load and preprocess example input (single slice for benchmarking)
     input_nii = nib.load(image_path)
     data = quantile_normalization(input_nii, lower_quantile=0.01, upper_quantile=0.99)
-    data = crop_mri_volume(torch.tensor(data)).unsqueeze(0).to(device).squeeze()
+    data = crop_mri_volume(torch.tensor(data)).unsqueeze(0).to(device).squeeze()[:,:,150:200]
     final_outputs_dimensions = []
 
-    for dimension in ['axial', 'coronal', 'sagittal']: #'sagittal', 'coronal'
+    for dimension in ['axial']: #'sagittal', 'coronal'
         dataset = VolumeDataset(data, dimension)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
         
@@ -1684,14 +1684,16 @@ def main():
             print(f"---------{dimension} | {idx}/{len(dataloader)}--------")
             for _ in range(1):
                 gpu_memory_tracker()
-                cache_output = deepcache_inference(model, device, scheduler, input_slice, inference_step=inference_step, cache_interval=cache_interval, cache_branch_id=cache_branch_id, use_half=use_half)
+                cache_output = patch_inference(model, device, scheduler, input_slice, patch_size=patch_size, base_overlap=32, intensity_scale=2.0, target_patches=18, cache_interval=cache_interval, cache_branch_id=cache_branch_id)
+                # cache_output = deepcache_inference(model, device, scheduler, input_slice, inference_step=inference_step, cache_interval=cache_interval, cache_branch_id=cache_branch_id, use_half=use_half)
                 cache_outputs.append(cache_output.detach().cpu())
                 gpu_memory_tracker()
             cache_output = torch.clamp(torch.nan_to_num(torch.stack(cache_outputs).mean(0)), 0, 1)
             cache_outputs = []
+            
             final_outputs.extend(cache_output)
             orig_inputs.extend(orig_slice.detach().cpu().numpy())
-            input_slices.extend(input_slice.detach().cpu().numpy())
+            input_slices.extend(torch.rot90(input_slice.detach().cpu(), k=-1, dims=(2, 3)))
 
         if dimension == 'coronal':
             final_outputs = torch.rot90(torch.stack(final_outputs), k=-1, dims=(2, 3)).squeeze().detach().cpu().permute(1,0,-1).float().numpy()
@@ -1701,81 +1703,26 @@ def main():
             
         elif dimension == 'axial':
             final_outputs = torch.rot90(torch.stack(final_outputs), k=-1, dims=(2, 3)).squeeze().detach().cpu().permute(1,-1,0).float().numpy()
-            
+
         final_outputs_dimensions.append(final_outputs)
 
-    pdb.set_trace()
+    
+
     final_outputs = np.stack(final_outputs_dimensions).mean(0)
-    cache_metrics = evaluate_image_quality(torch.tensor(data).cpu().unsqueeze(1).float(), torch.tensor(final_outputs).unsqueeze(1).float())
-    input_slices = crop_mri_volume(torch.tensor(np.squeeze(np.stack(input_slices)))).permute(-1,0,1).numpy()
-    nib.save(nib.Nifti1Image(np.round(final_outputs * 1000), np.eye(4)*0.55), 'cache_output.nii.gz')
-    nib.save(nib.Nifti1Image(data.cpu().numpy(), np.eye(4)*0.55), 'cache_input.nii.gz')
-    nib.save(nib.Nifti1Image(input_slices, np.eye(4)*0.55), 'lowres_1.57mm.nii.gz')
     
+    input_slices = torch.tensor(np.squeeze(np.stack(input_slices))).permute(1,-1,0).numpy()
+
+    cache_metrics = evaluate_image_quality(final_outputs.transpose(-1,0,1)[:,None,...], data.cpu().numpy().transpose(-1,0,1)[:,None,...])
+
+    pdb.set_trace()
+    data = tio.transforms.CropOrPad(input_nii.shape)(data.unsqueeze(0).cpu().numpy()).squeeze()
+    final_outputs = tio.transforms.CropOrPad(input_nii.shape)(final_outputs[None]).squeeze()
+    input_slices = tio.transforms.CropOrPad(input_nii.shape)(input_slices[None]).squeeze()
 
     
-        # break
-    # Vanilla inference with optimizations
-    start_time = time.time()
-    vanilla_outputs = []
-    
-    for _ in range(1):
-        vanilla_output = vanilla_inference(model, device, scheduler, input_slice, 
-                                       progressive_inference=use_progressive, noise_level=0.7, use_half=use_half)
-        vanilla_outputs.append(vanilla_output)
-    vanilla_time = time.time() - start_time
-    print(f"Vanilla inference time: {vanilla_time:.2f} seconds")
-
-    vanilla_output = torch.stack(vanilla_outputs).squeeze().mean(0)
-    
-    start_time = time.time()
-    patch_output = patch_inference(model, device, scheduler, input_slice, patch_size=patch_size, base_overlap=base_overlap, intensity_scale=2.0,
-                    target_patches=patch_num,  # Set to specific number or None for minimum required
-                    progressive_inference=use_progressive, 
-                    noise_level=0.7, 
-                    use_half=use_half)
-    
-    patch_time = time.time() - start_time
-    print(f"Adaptive patch inference time: {patch_time:.2f} seconds")
-    print(f"Speedup: {vanilla_time / patch_time:.2f}x")
-    # DeepCache inference with optimizations
-    start_time = time.time()
-    deepcache_outputs = []
-    for _ in range(3):
-        cache_output = deepcache_inference(model, device, scheduler, input_slice, 
-                                        cache_interval=cache_interval, cache_branch_id=cache_branch_id,
-                                        use_half=use_half, progressive_inference=use_progressive, noise_level=0.7)
-        deepcache_outputs.append(cache_output)
-    cache_time = time.time() - start_time
-    print(f"DeepCache inference time: {cache_time:.2f} seconds")
-    print(f"Speedup: {vanilla_time / cache_time:.2f}x")
-
-    cache_output = torch.stack(deepcache_outputs).squeeze().mean(0)
-    # Compare image quality
-    baseline_metrics = evaluate_image_quality(torch.clamp(torch.nan_to_num(input_slice).squeeze(), 0, 1).detach().cpu().numpy(), test_slice.squeeze().detach().cpu().numpy())
-    ssim_baseline, psnr_baseline, lpips_baseline = baseline_metrics['SSIM'], baseline_metrics['PSNR'], baseline_metrics['LPIPS']
-    print(f"Quality comparison - Baseline 2x: PSNR: {psnr_baseline:.2f} dB, SSIM: {ssim_baseline:.4f}, LPIPS: {lpips_baseline:.4f}")
-    
-    vanilla_metrics = evaluate_image_quality(torch.clamp(vanilla_output.squeeze(), 0, 1).detach().cpu().numpy(), test_slice.squeeze().detach().cpu().numpy())
-    ssim_vanilla, psnr_vanilla, lpips_vanilla = vanilla_metrics['SSIM'], vanilla_metrics['PSNR'], vanilla_metrics['LPIPS']
-    cached_metrics = evaluate_image_quality(torch.clamp(cache_output.squeeze(), 0, 1).detach().cpu().numpy(), test_slice.squeeze().detach().cpu().numpy())
-    ssim_cached, psnr_cached, lpips_cached = cached_metrics['SSIM'], cached_metrics['PSNR'], cached_metrics['LPIPS']
-    print(f"Quality comparison - Vanilla: PSNR: {psnr_vanilla:.2f} dB, SSIM: {ssim_vanilla:.4f}, LPIPS: {lpips_vanilla:.4f}")
-    torchvision.utils.save_image(torch.hstack((torch.clamp(input_slice.squeeze(), 0, 1).detach().cpu(), 
-                                               torch.clamp(vanilla_output.squeeze(), 0, 1).detach().cpu(), 
-                                               test_slice.squeeze().detach().cpu())), f'vanilla_inference_use_xformers_{use_xformers}_half_precision_{use_half}.png')
-    
-    print(f"Quality comparison - Cached: PSNR: {psnr_cached:.2f} dB, SSIM: {ssim_cached:.4f}, LPIPS: {lpips_cached:.4f}")
-    torchvision.utils.save_image(torch.hstack((torch.clamp(input_slice.squeeze(), 0, 1).detach().cpu(), 
-                                               torch.clamp(cache_output.squeeze(), 0, 1).detach().cpu(), 
-                                               test_slice.squeeze().detach().cpu())), f'Cached_inference_use_xformers_{use_xformers}_half_precision_{use_half}.png')
-
-    patch_metrics = evaluate_image_quality(torch.clamp(torch.nan_to_num(patch_output).squeeze(), 0, 1).detach().cpu().numpy(), test_slice.squeeze().detach().cpu().numpy())
-    ssim_patch, psnr_patch, lpips_patch = patch_metrics['SSIM'], patch_metrics['PSNR'], patch_metrics['LPIPS']
-    print(f"Quality comparison - Adaptive Patch: PSNR: {psnr_patch:.2f} dB, SSIM: {ssim_patch:.4f}, LPIPS: {lpips_patch:.4f}")    
-    torchvision.utils.save_image(torch.hstack((torch.clamp(input_slice.squeeze(), 0, 1).detach().cpu(), 
-                                                torch.clamp(patch_output.squeeze(), 0, 1).detach().cpu(), 
-                                                test_slice.squeeze().detach().cpu())), f'patch_inference_use_xformers_{use_xformers}_half_precision_{use_half}.png')
+    nib.save(nib.Nifti1Image(np.round(final_outputs * 1000), affine=input_nii.affine), 'cache_output.nii.gz')
+    nib.save(nib.Nifti1Image(data.cpu().numpy(), affine=input_nii.affine), 'cache_input.nii.gz')
+    nib.save(nib.Nifti1Image(input_slices, affine=input_nii.affine), 'lowres_1.57mm.nii.gz')
     
 if __name__ == "__main__":
     main()

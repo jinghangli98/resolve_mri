@@ -11,8 +11,7 @@ from tqdm import tqdm
 from torch.amp import autocast
 import pdb
 from utils import downsample_upsample
-from metrics import evaluate_image_quality
-import xformers
+from metrics import evaluate_image_quality, calculate_lpips, calculate_ssim
 import xformers.ops
 from torch.cuda.amp import GradScaler, autocast
 import torchvision
@@ -21,6 +20,7 @@ from skimage.filters import sobel
 from torch.utils.data import Dataset, DataLoader
 from typing import Optional, Union
 import time
+from itertools import chain
 
 def crop_mri_volume(data, threshold=0.01, padding=1, divisible_by=16):
     """
@@ -95,8 +95,7 @@ def gpu_memory_tracker(
     clear_cache: bool = False,
     log: bool = True,
     return_stats: bool = False,
-    sleep_interval: Optional[float] = None
-) -> Optional[dict]:
+    sleep_interval: Optional[float] = None) -> Optional[dict]:
     """
     Track GPU memory usage and optionally clear cache.
     
@@ -206,7 +205,7 @@ class VolumeDataset(Dataset):
         
         if self.transform:
             slice_tensor = self.transform(slice_tensor)
-        slice_tensor = downsample_upsample(slice_tensor.unsqueeze(0), scale_factor=0.5, mode='bilinear')
+        slice_tensor = downsample_upsample(slice_tensor.unsqueeze(0), scale_factor=0.99, mode='bilinear')
         
         return slice_tensor.squeeze(0), slice_tensor_original
 
@@ -756,6 +755,99 @@ class MonaiAdaptiveDeepCache:
         self.batch_size = None
         self.step_counter = 0
 
+def deepcache_inference(model, device, scheduler, t1w, inference_step=100, cache_interval=5, cache_branch_id=0, 
+                        progressive_inference=False, noise_level=0.7, use_half=True):
+    """
+    Run inference with DeepCache optimization for faster generation with half precision.
+    
+    Args:
+        model: The diffusion model
+        device: Device to run inference on
+        scheduler: Diffusion scheduler
+        t1w: Input image
+        cache_interval: How often to update the cache (N value)
+        cache_branch_id: Which branch to use for caching (0=shallowest, higher=deeper)
+        progressive_inference: Whether to use progressive inference
+        noise_level: Progressive inference noise level (0.0 to 1.0)
+        use_half: Whether to use half precision (FP16)
+    
+    Returns:
+        Generated image
+    """
+    model.eval()
+    
+    # Initialize DeepCache
+    deepcache = MonaiDeepCache(model, cache_interval=cache_interval, cache_branch_id=cache_branch_id)
+    deepcache.enable()
+    
+    try:
+        with torch.no_grad():
+            # Setup
+            torch.cuda.empty_cache()
+
+            input_img = t1w
+            if use_half:
+                input_img = input_img.half()
+                
+            scheduler.set_timesteps(num_inference_steps=inference_step)
+            
+            # Initial setup for progressive inference if enabled
+            if progressive_inference:
+                current_img = input_img.clone()
+                noise_timestep = int(noise_level * len(scheduler.timesteps))
+                noise_timestep = max(min(noise_timestep, len(scheduler.timesteps)-1), 0)
+                noise = torch.randn_like(current_img, device=device)
+                if use_half:
+                    noise = noise.half()
+                    
+                t = scheduler.timesteps[noise_timestep]
+
+                alpha_cumprod = scheduler.alphas_cumprod.to(device)
+                if use_half:
+                    alpha_cumprod = alpha_cumprod.half()
+                    
+                sqrt_alpha_t = alpha_cumprod[t] ** 0.5
+                sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
+                current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
+                
+                starting_timestep_idx = noise_timestep
+                timesteps = scheduler.timesteps[starting_timestep_idx:]
+            else:
+                noise = torch.randn_like(input_img).to(device)
+                if use_half:
+                    noise = noise.half()
+                    
+                current_img = noise  # for the TSE image, we start from random noise
+                timesteps = scheduler.timesteps
+            
+            # Main inference loop
+            progress_bar = tqdm(timesteps, desc="DeepCache Inferencing")
+            
+            for t in progress_bar:
+                # Prepare for this step
+                deepcache.pre_step()
+                
+                # Update progress bar with mode
+                if deepcache.step_counter % cache_interval == 0:
+                    progress_bar.set_postfix({"mode": "full  "})
+                else:
+                    progress_bar.set_postfix({"mode": "cached"})
+                    
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_half):
+                    # Combine input and current noisy image
+                    combined = torch.cat((input_img, current_img), dim=1)
+                    
+                    # Run model with DeepCache
+                    model_output = model(combined, timesteps=torch.Tensor((t,)).to(device))
+                    
+                    # Update the noisy image
+                    current_img, _ = scheduler.step(model_output, t, current_img)
+                        
+            return current_img
+    finally:
+        # Always restore the original model
+        deepcache.disable()
+        
 def adaptive_deepcache_inference(model, device, scheduler, t1w, inference_step=100, 
                                 cache_interval=5, cache_branch_id=0, similarity_threshold=0.85,
                                 progressive_inference=False, noise_level=0.7, use_half=True):
@@ -1017,156 +1109,371 @@ def vanilla_inference(model, device, scheduler, t1w, progressive_inference=False
                     
         return current_img
 
-def patch_inference(model, device, scheduler, t1w, patch_size=128, base_overlap=32, intensity_scale=2.0, target_patches=None, progressive_inference=False, noise_level=0.7, use_half=True, use_deepcache=True, cache_interval=20, cache_branch_id=0):
+def parselate(image, patch_size, overlap, patch_num=None, positions=None, overlap_map=None, cache_depth=1):
     """
-    Patch-based inference for large images using adaptive patch placement with optional DeepCache optimization.
+    Parselate an image into patches with adaptive patch location selection,
+    ensuring complete coverage of the image. If patch_num is None, computes the
+    minimum number of patches needed to cover the entire image.
     
     Args:
-        model: The model to use for inference
-        device: Computation device
-        scheduler: Diffusion scheduler
-        t1w: Input image tensor
-        patch_size (int): Size of each patch (e.g., 128).
-        base_overlap (int): Minimum overlap between patches (reduces seams).
-        intensity_scale (float): How much to scale overlap based on information content
-        target_patches (int): Target number of patches (None = minimum required for coverage)
-        progressive_inference (bool): Whether to use progressive inference
-        noise_level (float): Noise level for progressive inference
-        use_half (bool): Whether to use half precision
-        use_deepcache (bool): Whether to use DeepCache optimization
-        cache_interval (int): How often to update the cache (N value), only used if use_deepcache=True
-        cache_branch_id (int): Which branch to use for caching (0=shallowest, higher=deeper), only used if use_deepcache=True
+        image: torch.Tensor of shape (B, C, H, W) or (C, H, W) or (H, W)
+        patch_size: Size of each patch (assumed square)
+        overlap: Base overlap between patches
+        patch_num: Target number of patches per image (None for auto-compute)
+        positions: Optional pre-computed patch positions
+        overlap_map: Optional pre-computed overlap map
+        cache_depth: Number of consecutive batch items to share the same patch locations
+                    (must divide batch size evenly)
+    
+    Returns:
+        patches: Tensor of patches with shape (B, patch_number, C, patch_size, patch_size)
+        positions: List of patch positions with length B (expanded from cache groups)
+        overlap_map: List of overlap maps with length B (expanded from cache groups)
     """
-    import math
-    from tqdm import tqdm
+    import torch
+    import numpy as np
     
-    model.eval()
+    # Handle different input shapes
+    if len(image.shape) == 2:  # (H, W)
+        H, W = image.shape
+        image = image.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        B, C = 1, 1
+    elif len(image.shape) == 3:  # (C, H, W)
+        C, H, W = image.shape
+        image = image.unsqueeze(0)  # (1, C, H, W)
+        B = 1
+    elif len(image.shape) == 4:  # (B, C, H, W)
+        B, C, H, W = image.shape
+    else:
+        raise ValueError(f"Unsupported image shape: {image.shape}")
     
-    # Initialize DeepCache if enabled
-    deepcache = None
-    if use_deepcache:
-        deepcache = MonaiDeepCache(model, cache_interval=cache_interval, cache_branch_id=cache_branch_id)
-        deepcache.enable()
+    # Validate cache_depth
+    if cache_depth > B:
+        cache_depth = B
+    if B % cache_depth != 0:
+        raise ValueError(f"Batch size ({B}) must be divisible by cache_depth ({cache_depth})")
     
-    try:
-        # --- Adaptive Patch Extraction ---
-        B, C, H, W = t1w.shape
+    # Initialize with proper dimensions for reshaping later
+    batch_patches = []
+    all_positions = []  # This will be the compressed version (length B/cache_depth)
+    all_overlap_maps = []  # This will be the compressed version (length B/cache_depth)
+    
+    # Process each cache group
+    for group_idx in range(0, B, cache_depth):
+        # Compute positions based on the first image in the group
+        if C > 1:
+            info_image = image[group_idx].mean(dim=0).detach().cpu().numpy()
+        else:
+            info_image = image[group_idx, 0].detach().cpu().numpy()
         
-        patch_num = (H//patch_size) ** 2
-
-        # Extract single image from batch for patch planning
-        # Assuming we process one image at a time (B=1)
-        image = t1w[0, 0].cpu().numpy()  # Use first channel for information map
+        # Compute positions if not provided
+        if positions is None or overlap_map is None:
+            if patch_num is None:
+                # Auto-compute minimum number of patches needed for full coverage
+                group_positions = create_covering_grid(H, W, patch_size, overlap)
+                group_overlap_map = np.ones((H, W))  # Default overlap map
+            else:
+                # First get adaptive positions
+                group_positions, group_overlap_map = adaptive_patch_locations(
+                    info_image, 
+                    patch_size=patch_size, 
+                    base_overlap=overlap, 
+                    intensity_scale=2.0, 
+                    target_patches=patch_num
+                )
+                
+                # Then ensure full coverage with a grid fallback
+                grid_positions = create_covering_grid(H, W, patch_size, overlap)
+                
+                # Combine adaptive and grid positions, removing duplicates
+                all_pos = group_positions + grid_positions
+                unique_pos = []
+                seen = set()
+                for pos in all_pos:
+                    if pos not in seen:
+                        seen.add(pos)
+                        unique_pos.append(pos)
+                group_positions = unique_pos
+        else:
+            group_positions, group_overlap_map = positions, overlap_map
         
-        # Get adaptive patch positions
-        positions, overlap_map = adaptive_patch_locations(
-            image, 
-            patch_size=patch_size, 
-            base_overlap=base_overlap, 
-            intensity_scale=intensity_scale,
-            target_patches=target_patches
-        )
-        plot_patch_heatmap(image, positions, overlap_map)
-        # Extract patches based on adaptive positions
-        patches = []
-        for y, x in positions:
-            # Ensure patch is within bounds
-            y_end = min(y + patch_size, H)
-            x_end = min(x + patch_size, W)
+        num_patches = len(group_positions)
+        
+        # Store the positions and overlap map for this cache group
+        all_positions.append(group_positions)
+        all_overlap_maps.append(group_overlap_map)
+        
+        # Extract patches for all images in this cache group using the same positions
+        for b in range(group_idx, min(group_idx + cache_depth, B)):
+            # For each batch item, create a list to hold all its patches
+            image_patches = []
             
-            # Handle edge cases - make sure patches have consistent size
-            if y_end - y < patch_size:
-                y = max(0, y_end - patch_size)
-            if x_end - x < patch_size:
-                x = max(0, x_end - patch_size)
+            for y, x in group_positions:
+                # Ensure patch is within bounds
+                y_end = min(y + patch_size, H)
+                x_end = min(x + patch_size, W)
                 
-            patch = t1w[..., y:y+patch_size, x:x+patch_size]
-            patches.append(patch)
-        
-        # --- Process Each Patch ---
-        processed_patches = []
-        for patch_idx, patch in enumerate(tqdm(patches, desc="Processing Patches")):
-            with torch.no_grad():
-                # Move patch to device & cast to half if needed
-                patch = patch.to(device)
-                if use_half:
-                    patch = patch.half()
-                
-                # --- Inference Logic (Per Patch) ---
-                if progressive_inference:
-                    current_img = patch.clone()
-                    noise_timestep = int(noise_level * len(scheduler.timesteps))
-                    noise_timestep = max(min(noise_timestep, len(scheduler.timesteps)-1), 0)
-                    noise = torch.randn_like(current_img, device=device)
-                    if use_half:
-                        noise = noise.half()
+                # Handle edge cases - make sure patches have consistent size
+                if y_end - y < patch_size:
+                    y = max(0, y_end - patch_size)
+                if x_end - x < patch_size:
+                    x = max(0, x_end - patch_size)
                     
-                    t = scheduler.timesteps[noise_timestep]
-                    alpha_cumprod = scheduler.alphas_cumprod.to(device)
-                    if use_half:
-                        alpha_cumprod = alpha_cumprod.half()
-                    
-                    sqrt_alpha_t = alpha_cumprod[t] ** 0.5
-                    sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
-                    current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
-                    timesteps = scheduler.timesteps[noise_timestep:]
-                else:
-                    noise = torch.randn_like(patch).to(device)
-                    if use_half:
-                        noise = noise.half()
-                    current_img = noise
-                    timesteps = scheduler.timesteps
-
-                # --- Denoising Loop (with or without DeepCache) ---
-                progress_desc = f"Patch {patch_idx+1}/{len(patches)}"
-                progress_bar = tqdm(timesteps, desc=progress_desc, leave=False)
-                
-                for t in progress_bar:
-                    # DeepCache pre-step preparation if enabled
-                    if use_deepcache:
-                        deepcache.pre_step()
-                        
-                        # Update progress bar with mode for DeepCache
-                        if deepcache.step_counter % cache_interval == 0:
-                            progress_bar.set_postfix({"mode": "full  "})
-                        else:
-                            progress_bar.set_postfix({"mode": "cached"})
-                    
-                    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_half):
-                        combined = torch.cat((patch, current_img), dim=1)
-                        model_output = model(combined, timesteps=torch.Tensor((t,)).to(device))
-                        current_img, _ = scheduler.step(model_output, t, current_img)
-                
-                processed_patches.append(current_img.cpu())
-        
-        # --- Reconstruct Full Image ---
-        output = torch.zeros_like(t1w, device="cpu")
-        count = torch.zeros_like(t1w, device="cpu")  # For averaging overlaps
-        
-        for (y, x), patch in zip(positions, processed_patches):
-            # Ensure we're within bounds
-            y_end = min(y + patch_size, H)
-            x_end = min(x + patch_size, W)
+                patch = image[b, :, y:y+patch_size, x:x+patch_size]
+                image_patches.append(patch)
             
-            # Handle edge cases
-            if y_end - y < patch_size:
-                y = max(0, y_end - patch_size)
-            if x_end - x < patch_size:
-                x = max(0, x_end - patch_size)
-                
-            output[..., y:y+patch_size, x:x+patch_size] += patch
-            count[..., y:y+patch_size, x:x+patch_size] += 1
-        
-        # Average overlapping regions
-        non_zero_mask = (count > 0)
-        output[non_zero_mask] /= count[non_zero_mask]
-        
-        return output.to(device)
+            # Stack all patches for this image into a tensor of shape (num_patches, C, patch_size, patch_size)
+            image_patches_tensor = torch.stack(image_patches)
+            batch_patches.append(image_patches_tensor)
     
-    finally:
-        # Always disable DeepCache if it was enabled
-        if use_deepcache and deepcache is not None:
-            deepcache.disable()
+    # Stack all batch patches into a tensor of shape (B, num_patches, C, patch_size, patch_size)
+    patches_tensor = torch.stack(batch_patches)
+    
+    # --- Expand positions and overlap maps to match batch size ---
+    expanded_positions = []
+    expanded_overlap_maps = []
+    
+    for group_idx in range(0, B, cache_depth):
+        cache_group_idx = group_idx // cache_depth
+        group_positions = all_positions[cache_group_idx]
+        group_overlap_map = all_overlap_maps[cache_group_idx]
+        
+        # Repeat the positions and overlap map for each image in this cache group
+        for b in range(group_idx, min(group_idx + cache_depth, B)):
+            expanded_positions.append(group_positions)
+            expanded_overlap_maps.append(group_overlap_map)
+    
+    return patches_tensor, expanded_positions, expanded_overlap_maps
+
+def create_covering_grid(H, W, patch_size, overlap):
+    """
+    Create a grid of patch positions that ensures complete coverage of the image.
+    Returns the minimum number of patch positions needed to cover the entire image.
+    """
+    stride = max(1, patch_size - overlap)
+    
+    # Calculate number of patches needed in each dimension
+    num_y = int(np.ceil((H - patch_size) / stride)) + 1 if H > patch_size else 1
+    num_x = int(np.ceil((W - patch_size) / stride)) + 1 if W > patch_size else 1
+    
+    # Adjust stride to ensure perfect coverage
+    if num_y > 1:
+        actual_stride_y = (H - patch_size) / (num_y - 1)
+    else:
+        actual_stride_y = 0
+    
+    if num_x > 1:
+        actual_stride_x = (W - patch_size) / (num_x - 1)
+    else:
+        actual_stride_x = 0
+    
+    # Generate grid positions
+    positions = []
+    for i in range(num_y):
+        for j in range(num_x):
+            y = min(int(round(i * actual_stride_y)), H - patch_size)
+            x = min(int(round(j * actual_stride_x)), W - patch_size)
+            positions.append((y, x))
+    
+    return positions
+
+def parselate_with_lpips(image, patch_size, overlap, patch_num, lpips_threshold=0.85, positions=None, overlap_map=None, cache_depth=2, device='cuda'):
+    """
+    Parselate an image into patches with adaptive patch location selection and divide them into
+    full inference and progressive inference based on LPIPS scores.
+    
+    Args:
+        image: torch.Tensor of shape (B, C, H, W) or (C, H, W) or (H, W)
+        patch_size: Size of each patch (assumed square)
+        overlap: Base overlap between patches
+        patch_num: Target number of patches per image
+        lpips_threshold: Threshold for LPIPS score to determine inference method
+        positions: Optional pre-computed patch positions
+        overlap_map: Optional pre-computed overlap map
+        cache_depth: Number of consecutive batch items to share the same patch locations
+                    (must divide batch size evenly)
+        device: Device to use for LPIPS calculation ('cuda' or 'cpu')
+        
+    Returns:
+        full_inference_patches: Tensor of patches for full inference
+        progressive_inference_patches: Tensor of patches for progressive inference
+        full_inference_positions: PositionInfo object containing positions and batch indices
+        progressive_inference_positions: PositionInfo object containing positions and batch indices
+        similar_patch_indices: List where similar_patch_indices[i] is the index in full_inference_patches
+                              that is similar to progressive_inference_patches[i]
+    """
+    import torch
+    from itertools import chain
+    
+    # First, use the original parselate function to get patches, positions, and overlap maps
+    patches_tensor, expanded_positions, expanded_overlap_maps = parselate(
+        image, patch_size, overlap, patch_num, positions, overlap_map, cache_depth
+    )
+    
+    # Get dimensions
+    B, num_patches, C, H, W = patches_tensor.shape
+    
+    # Validate batch size and cache depth
+    if cache_depth > B:
+        cache_depth = B
+
+    if B % cache_depth != 0:
+        raise ValueError(f"Batch size ({B}) must be divisible by cache_depth ({cache_depth})")
+    
+    # Ensure cache_depth is at least 2 (needed for LPIPS comparison)
+    if cache_depth < 2:
+        raise ValueError(f"cache_depth must be at least 2 for LPIPS comparison, got {cache_depth}")
+    
+    # Initialize lists for full and progressive inference
+    full_inference_patches = []
+    progressive_inference_patches = []
+    full_inference_positions = []
+    progressive_inference_positions = []
+    full_inference_batch_indices = []
+    progressive_inference_batch_indices = []
+    similar_patch_indices = []
+    
+    # We'll need to track all full inference patches and their original positions
+    full_patches_tracking = []
+    full_positions_tracking = []
+    full_batch_indices_tracking = []
+    
+    # Process each cache group
+    num_groups = B // cache_depth
+    
+    for group_idx in range(num_groups):
+        base_idx = group_idx * cache_depth
+        
+        # Always add the first patch in each group to full inference
+        full_inference_patches.append(patches_tensor[base_idx])
+        full_inference_positions.append(expanded_positions[base_idx])
+        
+        # Track these patches in our tracking lists
+        full_patches_tracking.extend(patches_tensor[base_idx])
+        full_positions_tracking.extend(expanded_positions[base_idx])
+        full_batch_indices_tracking.extend([base_idx] * len(expanded_positions[base_idx]))
+        
+        # Track batch indices for all patches in the reference image
+        full_inference_batch_indices.extend([base_idx] * len(expanded_positions[base_idx]))
+        
+        # For each remaining patch in the group, calculate LPIPS with the reference patch
+        # and assign to full or progressive inference based on the threshold
+        for offset in range(1, cache_depth):
+            compare_idx = base_idx + offset
+            
+            # Skip if we've reached the end of the batch
+            if compare_idx >= B:
+                continue
+            
+            # Calculate LPIPS between reference patch and current patch
+            lpips_score = calculate_ssim(patches_tensor[base_idx], patches_tensor[compare_idx], return_mean=False)
+            # lpips_score = calculate_lpips(patches_tensor[base_idx], patches_tensor[compare_idx], return_mean=False,  device=device)
+            
+            # Ensure lpips_score is a PyTorch tensor
+            if not isinstance(lpips_score, torch.Tensor):
+                lpips_score = torch.tensor(lpips_score, device=device)
+            
+            # Create masks for high and low similarity
+            high_dissimilarity_mask = lpips_score < lpips_threshold
+            low_dissimilarity_mask = lpips_score >= lpips_threshold
+            
+            # Convert to boolean mask if needed
+            if high_dissimilarity_mask.dtype != torch.bool:
+                high_dissimilarity_mask = high_dissimilarity_mask.bool()
+            if low_dissimilarity_mask.dtype != torch.bool:
+                low_dissimilarity_mask = low_dissimilarity_mask.bool()
+                
+            # Add patches with high dissimilarity to full inference
+            if torch.any(high_dissimilarity_mask):
+                # Extract patches that exceed the threshold
+                high_patches = patches_tensor[compare_idx][high_dissimilarity_mask.cpu()]
+                
+                # Only append if there are any patches
+                if len(high_patches) > 0:
+                    full_inference_patches.append(high_patches)
+                    
+                    # Convert mask to numpy for indexing lists
+                    high_mask_np = high_dissimilarity_mask.cpu().numpy()
+                    
+                    # Also extract corresponding positions
+                    high_positions = [pos for i, pos in enumerate(expanded_positions[compare_idx]) 
+                                     if i < len(high_mask_np) and high_mask_np[i]]
+                    
+                    full_inference_positions.append(high_positions)
+                    
+                    # Track these patches in our tracking lists
+                    full_patches_tracking.extend(high_patches)
+                    full_positions_tracking.extend(high_positions)
+                    full_batch_indices_tracking.extend([compare_idx] * len(high_positions))
+                    
+                    # Track batch indices for high dissimilarity patches
+                    full_inference_batch_indices.extend([compare_idx] * len(high_positions))
+            
+            # Add patches with low dissimilarity to progressive inference
+            if torch.any(low_dissimilarity_mask):
+                # Extract patches that are below the threshold
+                low_patches = patches_tensor[compare_idx][low_dissimilarity_mask.cpu()]
+                
+                # Only append if there are any patches
+                if len(low_patches) > 0:
+                    progressive_inference_patches.append(low_patches)
+                    
+                    # Convert mask to numpy for indexing lists
+                    low_mask_np = low_dissimilarity_mask.cpu().numpy()
+                    
+                    # Also extract corresponding positions
+                    low_positions = [pos for i, pos in enumerate(expanded_positions[compare_idx]) 
+                                    if i < len(low_mask_np) and low_mask_np[i]]
+                    
+                    progressive_inference_positions.append(low_positions)
+                    
+                    # Track batch indices for low dissimilarity patches
+                    progressive_inference_batch_indices.extend([compare_idx] * len(low_positions))
+                    
+                    # For each low similarity patch, find the corresponding similar patch in full_inference_patches
+                    # These are the patches from the base_idx that have low LPIPS score
+                    for i in range(len(low_mask_np)):
+                        if low_mask_np[i]:
+                            # Find the corresponding patch in the base_idx patches
+                            # We need to find which patch in full_patches_tracking matches this
+                            # We can use the position information to match them
+                            current_position = expanded_positions[compare_idx][i]
+                            
+                            # Find the patch in base_idx with the same position
+                            for j, pos in enumerate(expanded_positions[base_idx]):
+                                if pos == current_position:
+                                    # Now find where this base_idx patch is in full_patches_tracking
+                                    for k, (track_pos, track_batch) in enumerate(zip(full_positions_tracking, full_batch_indices_tracking)):
+                                        if track_pos == pos and track_batch == base_idx:
+                                            similar_patch_indices.append(k)
+                                            break
+                                    break
+    
+    # Stack patches if there are any
+    if full_inference_patches:
+        full_inference_patches = torch.cat(full_inference_patches, dim=0)
+    else:
+        full_inference_patches = torch.empty((0, C, H, W), device=patches_tensor.device)
+        
+    if progressive_inference_patches:
+        progressive_inference_patches = torch.cat(progressive_inference_patches, dim=0)
+    else:
+        progressive_inference_patches = torch.empty((0, C, H, W), device=patches_tensor.device)
+    
+    # Flatten position lists
+    full_inference_positions_flat = list(chain(*full_inference_positions))
+    progressive_inference_positions_flat = list(chain(*progressive_inference_positions))
+    
+    # Create PositionInfo objects to hold positions and batch indices
+    class PositionInfo:
+        def __init__(self, positions, batch_indices):
+            self.positions = positions
+            self.batch_indices = batch_indices
+    
+    full_info = PositionInfo(full_inference_positions_flat, full_inference_batch_indices)
+    progressive_info = PositionInfo(progressive_inference_positions_flat, progressive_inference_batch_indices)
+    
+    return full_inference_patches, progressive_inference_patches, full_info, progressive_info, similar_patch_indices
 
 def compute_information_map(image):
     """Convert image to gradient magnitude (high = more info)."""
@@ -1194,7 +1501,6 @@ def adaptive_patch_locations(image, patch_size=128, base_overlap=32, intensity_s
     """
     import math
     import numpy as np
-    
     info_map = compute_information_map(image)
     H, W = info_map.shape
     overlap_map = np.zeros((H, W))
@@ -1434,98 +1740,148 @@ def additional_adaptive_patch_locations(image, patch_size=128, base_overlap=32, 
     
     return positions, overlap_map
 
-def deepcache_inference(model, device, scheduler, t1w, inference_step=100, cache_interval=5, cache_branch_id=0, 
-                        progressive_inference=False, noise_level=0.7, use_half=True):
+def patch_inference(model, device, scheduler, patches, positions_info, original_shape,
+                 progressive_inference=False, noise_level=0.7, use_half=True,
+                 use_deepcache=True, cache_interval=20, cache_branch_id=0, patch_ref=None):
     """
-    Run inference with DeepCache optimization for faster generation with half precision.
+    Patch-based inference for large images using pre-computed patches with optional DeepCache optimization.
+    Processes all patches in parallel and reconstructs them by batch index.
     
     Args:
-        model: The diffusion model
-        device: Device to run inference on
+        model: The model to use for inference
+        device: Computation device
         scheduler: Diffusion scheduler
-        t1w: Input image
-        cache_interval: How often to update the cache (N value)
-        cache_branch_id: Which branch to use for caching (0=shallowest, higher=deeper)
-        progressive_inference: Whether to use progressive inference
-        noise_level: Progressive inference noise level (0.0 to 1.0)
-        use_half: Whether to use half precision (FP16)
-    
-    Returns:
-        Generated image
+        patches: Pre-computed patches tensor with shape (num_total_patches, C, patch_size, patch_size)
+        positions_info: PositionInfo object containing positions and batch indices
+        original_shape: Original shape of the input image (B, C, H, W)
+        progressive_inference (bool): Whether to use progressive inference
+        noise_level (float): Noise level for progressive inference
+        use_half (bool): Whether to use half precision
+        use_deepcache (bool): Whether to use DeepCache optimization
+        cache_interval (int): How often to update the cache (N value), only used if use_deepcache=True
+        cache_branch_id (int): Which branch to use for caching (0=shallowest, higher=deeper), only used if use_deepcache=True
     """
+    import torch
+    from tqdm import tqdm
+    
     model.eval()
     
-    # Initialize DeepCache
-    deepcache = MonaiDeepCache(model, cache_interval=cache_interval, cache_branch_id=cache_branch_id)
-    deepcache.enable()
+    # Initialize DeepCache if enabled
+    deepcache = None
+    if use_deepcache:
+        deepcache = MonaiDeepCache(model, cache_interval=cache_interval, cache_branch_id=cache_branch_id)
+        deepcache.enable()
     
     try:
-        with torch.no_grad():
-            # Setup
-            torch.cuda.empty_cache()
-
-            input_img = t1w
+        # Get dimensions
+        num_total_patches, C, patch_size, patch_size_h = patches.shape
+        B, _, H, W = original_shape
+        
+        # Move patches to device & cast to half if needed
+        device_patches = patches.to(device)
+        if use_half:
+            device_patches = device_patches.half()
+        
+        # --- Parallel Inference Logic ---
+        if progressive_inference:
+            current_img = patch_ref.clone()
+            noise_timestep = int(noise_level * len(scheduler.timesteps))
+            noise_timestep = max(min(noise_timestep, len(scheduler.timesteps)-1), 0)
+            
+            # Generate noise for all patches at once
+            noise = torch.randn_like(current_img, device=device)
             if use_half:
-                input_img = input_img.half()
-                
-            scheduler.set_timesteps(num_inference_steps=inference_step)
+                noise = noise.half()
             
-            # Initial setup for progressive inference if enabled
-            if progressive_inference:
-                current_img = input_img.clone()
-                noise_timestep = int(noise_level * len(scheduler.timesteps))
-                noise_timestep = max(min(noise_timestep, len(scheduler.timesteps)-1), 0)
-                noise = torch.randn_like(current_img, device=device)
-                if use_half:
-                    noise = noise.half()
-                    
-                t = scheduler.timesteps[noise_timestep]
-
-                alpha_cumprod = scheduler.alphas_cumprod.to(device)
-                if use_half:
-                    alpha_cumprod = alpha_cumprod.half()
-                    
-                sqrt_alpha_t = alpha_cumprod[t] ** 0.5
-                sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
-                current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
-                
-                starting_timestep_idx = noise_timestep
-                timesteps = scheduler.timesteps[starting_timestep_idx:]
-            else:
-                noise = torch.randn_like(input_img).to(device)
-                if use_half:
-                    noise = noise.half()
-                    
-                current_img = noise  # for the TSE image, we start from random noise
-                timesteps = scheduler.timesteps
+            t = scheduler.timesteps[noise_timestep]
+            alpha_cumprod = scheduler.alphas_cumprod.to(device)
+            if use_half:
+                alpha_cumprod = alpha_cumprod.half()
             
-            # Main inference loop
-            progress_bar = tqdm(timesteps, desc="DeepCache Inferencing")
+            sqrt_alpha_t = alpha_cumprod[t] ** 0.5
+            sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
+            current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
+            timesteps = scheduler.timesteps[noise_timestep:]
+        else:
+            noise = torch.randn_like(device_patches, device=device)
+            if use_half:
+                noise = noise.half()
+            current_img = noise
+            timesteps = scheduler.timesteps
+        
+        # --- Denoising Loop ---
+        with torch.no_grad():
+            progress_bar = tqdm(timesteps, desc=f"Processing {num_total_patches} patches")
             
             for t in progress_bar:
-                # Prepare for this step
-                deepcache.pre_step()
+                # DeepCache pre-step preparation if enabled
+                if use_deepcache:
+                    deepcache.pre_step()
+                    
+                    # Update progress bar with mode for DeepCache
+                    if deepcache.step_counter % cache_interval == 0:
+                        progress_bar.set_postfix({"mode": "full  "})
+                    else:
+                        progress_bar.set_postfix({"mode": "cached"})
                 
-                # Update progress bar with mode
-                if deepcache.step_counter % cache_interval == 0:
-                    progress_bar.set_postfix({"mode": "full  "})
-                else:
-                    progress_bar.set_postfix({"mode": "cached"})
-                    
+                # Process all patches at once
                 with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_half):
-                    # Combine input and current noisy image
-                    combined = torch.cat((input_img, current_img), dim=1)
+                    timestep_batch = torch.full((num_total_patches,), t, device=device, dtype=torch.long)
                     
-                    # Run model with DeepCache
-                    model_output = model(combined, timesteps=torch.Tensor((t,)).to(device))
+                    # Prepare input by combining original patches and current denoised images
+                    try:
+                        combined_input = torch.cat([device_patches, current_img], dim=1)
+                    except:
+                        pdb.set_trace()
                     
-                    # Update the noisy image
+                    # Forward pass through the model with all patches at once
+                    model_output = model(combined_input, timesteps=timestep_batch)
+                    
+                    # Apply scheduler step to all patches at once
                     current_img, _ = scheduler.step(model_output, t, current_img)
-                        
-            return current_img
+        
+        # Move processed patches back to CPU
+        processed_patches = current_img.cpu()
+
+        # --- Reconstruct Full Images ---
+        final_output = torch.zeros((B, C, H, W), device="cpu")
+        count = torch.zeros_like(final_output, device="cpu")
+        
+        # Get the extracted batch indices from the positions_info
+        batch_indices = positions_info.batch_indices
+        positions = positions_info.positions
+        
+        # Place each patch in its position in the appropriate batch output
+        for idx, (y, x) in enumerate(positions):
+            if idx >= num_total_patches:
+                break
+                
+            patch = processed_patches[idx]
+            batch_idx = batch_indices[idx]
+            
+            # Ensure we're within bounds
+            y_end = min(y + patch_size, H)
+            x_end = min(x + patch_size, W)
+            
+            # Handle edge cases
+            if y_end - y < patch_size:
+                y = max(0, y_end - patch_size)
+            if x_end - x < patch_size:
+                x = max(0, x_end - patch_size)
+                
+            final_output[batch_idx, :, y:y+patch_size, x:x+patch_size] += patch
+            count[batch_idx, :, y:y+patch_size, x:x+patch_size] += 1
+        
+        # Average overlapping regions
+        non_zero_mask = (count > 0)
+        final_output[non_zero_mask] /= count[non_zero_mask]
+        
+        return final_output.to(device), current_img
+    
     finally:
-        # Always restore the original model
-        deepcache.disable()
+        # Always disable DeepCache if it was enabled
+        if use_deepcache and deepcache is not None:
+            deepcache.disable()
 
 def non_uniform_deepcache_inference(model, device, scheduler, t1w, 
                                    center_timestep=400, power=1.2, cache_branch_id=0,
@@ -1624,6 +1980,252 @@ def non_uniform_deepcache_inference(model, device, scheduler, t1w,
         # Always restore the original model
         deepcache.disable()
 
+def inference_patch_idx(full_inference_positions, progressive_inference_positions, inference_batch_id, cache_depth=2):
+    """
+    Find matching position indices between full inference and progressive inference for a specific batch.
+    
+    Args:
+        full_inference_positions: PositionInfo object with positions and batch_indices attributes
+        progressive_inference_positions: PositionInfo object with positions and batch_indices attributes
+        inference_batch_id: Base batch ID to use for full inference
+        cache_depth: Depth of the cache (default: 2)
+    
+    Returns:
+        tuple: (matching_indices, original_indices) where:
+            - matching_indices: Local indices in the batch_positions array
+            - original_indices: Global indices in the full positions array
+    """
+    import numpy as np
+    
+    # Convert to numpy arrays
+    full_positions = np.array(full_inference_positions.positions)
+    full_batch_indices = np.array(full_inference_positions.batch_indices)
+    
+    prog_positions = np.array(progressive_inference_positions.positions)
+    prog_batch_indices = np.array(progressive_inference_positions.batch_indices)
+    
+    # Filter positions for the specified batches
+    base_batch_mask = (full_batch_indices == inference_batch_id)
+    comp_batch_mask = (prog_batch_indices == inference_batch_id + cache_depth - 1)
+    
+    # Get positions for the specified batches
+    base_batch_positions = full_positions[base_batch_mask]
+    comp_batch_positions = prog_positions[comp_batch_mask]
+    
+    # Get original indices
+    base_original_indices = np.where(base_batch_mask)[0]
+    
+    # Initialize mask for matches
+    matches = np.zeros(len(base_batch_positions), dtype=bool)
+    
+    # For each position in the comparison batch, find matches in the base batch
+    for pos in comp_batch_positions:
+        current_matches = np.all(base_batch_positions == pos, axis=1)
+        matches = matches | current_matches
+    
+    # Get the indices of matches
+    matching_indices = np.where(matches)[0]
+    
+    # Map local indices to original indices
+    original_indices = base_original_indices[matching_indices]
+    
+    return matching_indices, original_indices
+
+def inference_patch_idx_all(full_inference_positions, progressive_inference_positions, cache_depth=2):
+    """
+    Find all matching position indices across all batches.
+    
+    Args:
+        full_inference_positions: PositionInfo object with positions and batch_indices attributes
+        progressive_inference_positions: PositionInfo object with positions and batch_indices attributes
+        cache_depth: Depth of the cache (default: 2)
+    
+    Returns:
+        dict: A dictionary containing:
+            - 'local_indices': List of local indices in their respective batch arrays
+            - 'global_indices': List of global indices in the full positions array
+            - 'batch_mapping': Dictionary mapping batch ID to indices in the returned lists
+    """
+    import numpy as np
+    
+    # Get unique batch IDs from full inference
+    full_batch_indices = np.array(full_inference_positions.batch_indices)
+    unique_batches = np.unique(full_batch_indices)
+    
+    # Calculate number of cache groups
+    max_batch = max(unique_batches)
+    cache_groups = (max_batch + 1) // cache_depth
+    
+    # Initialize result containers
+    local_indices = []
+    global_indices = []
+    batch_mapping = {}
+    
+    # Process each cache group
+    for group_idx in range(cache_groups):
+        base_batch_id = group_idx * cache_depth
+        
+        # Skip if this batch doesn't exist in our data
+        if base_batch_id not in unique_batches:
+            continue
+            
+        # Track start index for this batch in our result lists
+        batch_mapping[base_batch_id] = len(local_indices)
+        
+        # Get matching indices for this batch
+        batch_local, batch_global = inference_patch_idx(
+            full_inference_positions, 
+            progressive_inference_positions, 
+            base_batch_id, 
+            cache_depth
+        )
+        
+        # Add to our result lists
+        local_indices.extend(batch_local)
+        global_indices.extend(batch_global)
+    
+    return {
+        'local_indices': local_indices,
+        'global_indices': global_indices,
+        'batch_mapping': batch_mapping
+    }
+
+def combine_inference_results(full_results, progressive_results, full_inference_positions, progressive_inference_positions, patch_size):
+    """
+    Combine full inference and progressive inference results into a single output with improved edge handling.
+    
+    Args:
+        full_results: Tensor with full inference results, shape (B, C, H, W)
+        progressive_results: Tensor with progressive inference results, shape (B, C, H, W)
+        full_inference_positions: PositionInfo object for full inference
+        progressive_inference_positions: PositionInfo object for progressive inference
+        patch_size: Size of patches used for inference
+        
+    Returns:
+        combined_results: Tensor with combined results, shape (B, C, H, W)
+    """
+    import torch
+    import numpy as np
+    
+    # Get batch dimensions
+    B, C, H, W = full_results.shape
+    
+    # Initialize tracking tensors for both methods
+    full_mask = torch.zeros((B, 1, H, W), device=full_results.device)
+    prog_mask = torch.zeros((B, 1, H, W), device=progressive_results.device)
+    
+    # Initialize the result tensor with zeros
+    combined_results = torch.zeros_like(full_results)
+    
+    # Initialize weight accumulation tensors
+    full_weights = torch.zeros((B, 1, H, W), device=full_results.device)
+    prog_weights = torch.zeros((B, 1, H, W), device=progressive_results.device)
+    
+    # Generate window function once - use Hann window for smoother blending
+    window_1d = torch.hann_window(patch_size, periodic=False, device=full_results.device)
+    # Create 2D window by outer product
+    window_2d = window_1d.unsqueeze(1) * window_1d.unsqueeze(0)
+    
+    # Fill in results from full inference
+    for idx, ((y, x), batch_idx) in enumerate(zip(full_inference_positions.positions, full_inference_positions.batch_indices)):
+        # Calculate effective patch coordinates with proper boundary handling
+        y_start = y
+        x_start = x
+        y_end = min(y + patch_size, H)
+        x_end = min(x + patch_size, W)
+        
+        # Calculate patch dimensions
+        patch_h = y_end - y_start
+        patch_w = x_end - x_start
+        
+        # Get the corresponding section of the pre-computed window
+        weight_grid = window_2d[:patch_h, :patch_w]
+        
+        # Update the full inference region
+        h_slice = slice(y_start, y_end)
+        w_slice = slice(x_start, x_end)
+        
+        # Apply weighted contribution
+        full_weights[batch_idx, 0, h_slice, w_slice] += weight_grid
+        
+        # For each channel, apply the weighted contribution
+        for c in range(C):
+            patch_data = full_results[batch_idx, c, h_slice, w_slice]
+            combined_results[batch_idx, c, h_slice, w_slice] += patch_data * weight_grid
+        
+        # Mark this region as filled by full inference
+        full_mask[batch_idx, 0, h_slice, w_slice] = 1
+    
+    # Fill in results from progressive inference
+    for idx, ((y, x), batch_idx) in enumerate(zip(progressive_inference_positions.positions, progressive_inference_positions.batch_indices)):
+        # Calculate effective patch coordinates with proper boundary handling
+        y_start = y
+        x_start = x
+        y_end = min(y + patch_size, H)
+        x_end = min(x + patch_size, W)
+        
+        # Calculate patch dimensions
+        patch_h = y_end - y_start
+        patch_w = x_end - x_start
+        
+        # Get the corresponding section of the pre-computed window
+        weight_grid = window_2d[:patch_h, :patch_w]
+        
+        # Update the progressive inference region
+        h_slice = slice(y_start, y_end)
+        w_slice = slice(x_start, x_end)
+        
+        # Apply a gradually decreasing weight for progressive results where full results exist
+        # This helps create smoother transitions between the two result types
+        overlap_factor = torch.ones((patch_h, patch_w), device=progressive_results.device)
+        if torch.any(full_mask[batch_idx, 0, h_slice, w_slice] > 0):
+            # Create a smooth transition in overlapping regions
+            overlap_factor = torch.clamp(1.0 - full_mask[batch_idx, 0, h_slice, w_slice] * 0.8, 0.2, 1.0)
+        
+        effective_weight = weight_grid * overlap_factor
+        
+        # Apply weighted contribution
+        prog_weights[batch_idx, 0, h_slice, w_slice] += effective_weight
+        
+        # For each channel, apply the weighted contribution
+        for c in range(C):
+            patch_data = progressive_results[batch_idx, c, h_slice, w_slice]
+            combined_results[batch_idx, c, h_slice, w_slice] += patch_data * effective_weight
+    
+    # Normalize by accumulated weights to get weighted average, with epsilon to avoid division by zero
+    epsilon = 1e-6
+    total_weights = full_weights + prog_weights + epsilon
+    
+    # Normalize results by the total weights
+    for b in range(B):
+        for c in range(C):
+            combined_results[b, c] /= total_weights[b, 0]
+    
+    # Apply edge feathering to reduce artifacts
+    # Create feathering masks for image boundaries
+    feather_size = min(16, patch_size // 4)  # Size of feathering region
+    
+    # Create horizontal feathering masks
+    left_feather = torch.linspace(0.5, 1.0, feather_size, device=full_results.device)
+    right_feather = torch.linspace(1.0, 0.5, feather_size, device=full_results.device)
+    
+    # Create vertical feathering masks
+    top_feather = torch.linspace(0.5, 1.0, feather_size, device=full_results.device)
+    bottom_feather = torch.linspace(1.0, 0.5, feather_size, device=full_results.device)
+    
+    # Apply feathering to the edges
+    for b in range(B):
+        # Left edge
+        combined_results[b, :, :, :feather_size] *= left_feather.view(1, 1, -1)
+        # Right edge
+        combined_results[b, :, :, -feather_size:] *= right_feather.view(1, 1, -1)
+        # Top edge
+        combined_results[b, :, :feather_size, :] *= top_feather.view(1, -1, 1)
+        # Bottom edge
+        combined_results[b, :, -feather_size:, :] *= bottom_feather.view(1, -1, 1)
+    
+    return combined_results
+
 def main():
     import time
     # Configuration
@@ -1635,16 +2237,17 @@ def main():
     # image_path = 'undersampled.nii.gz'
 
     # DeepCache parameters to test
-    cache_interval = 2    # N value - higher means more speedup but potentially lower quality
+    cache_interval = 4    # N value - higher means more speedup but potentially lower quality
     cache_branch_id = 0   # Branch ID - 0=shallowest (fastest), higher=deeper (better quality)
+    lpips_threshold = 0.1 # LPIPS threshold for patch selection (higher means more patches for progressive inference)
     patch_size = 128
     image_size = 384
-    target_patches = 32
+    target_patches = 24
     patch_num = (image_size//patch_size) ** 2
     additional_patches = target_patches - patch_num
-    base_overlap = 32
-    batch_size = 1
-    inference_step = 100
+    base_overlap = 24
+    batch_size = 8
+    inference_step = 20
     # Performance optimization settings
     use_xformers = True   # Enable xformers for memory-efficient attention
     use_half = True  # Enable half precision (FP16)
@@ -1659,10 +2262,10 @@ def main():
     # Load and preprocess example input (single slice for benchmarking)
     input_nii = nib.load(image_path)
     data = quantile_normalization(input_nii, lower_quantile=0.01, upper_quantile=0.99)
-    data = crop_mri_volume(torch.tensor(data)).unsqueeze(0).to(device).squeeze()[:,:,150:200]
+    data = crop_mri_volume(torch.tensor(data)).unsqueeze(0).to(device).squeeze()
     final_outputs_dimensions = []
 
-    for dimension in ['axial']: #'sagittal', 'coronal'
+    for dimension in ['axial', 'sagittal', 'coronal']: #'sagittal', 'coronal'
         dataset = VolumeDataset(data, dimension)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
         
@@ -1684,14 +2287,35 @@ def main():
             print(f"---------{dimension} | {idx}/{len(dataloader)}--------")
             for _ in range(1):
                 gpu_memory_tracker()
-                cache_output = patch_inference(model, device, scheduler, input_slice, patch_size=patch_size, base_overlap=32, intensity_scale=2.0, target_patches=18, cache_interval=cache_interval, cache_branch_id=cache_branch_id)
+                full_inference_patches, progressive_inference_patches, full_inference_positions, progressive_inference_positions, patch_ids = parselate_with_lpips(input_slice, patch_size, overlap=32, patch_num=None, lpips_threshold=lpips_threshold, positions=None, overlap_map=None, cache_depth=4, device='cuda')      
+                # patch_ids = inference_patch_idx_all(full_inference_positions, progressive_inference_positions, cache_depth=2)       
+                print(f'{idx} | Progressive patches: {len(progressive_inference_patches)}, Full patches: {len(full_inference_patches)}, Patch ref: {len(patch_ids)}')
+                full_results, patch_ref = patch_inference(model, device, scheduler, full_inference_patches, full_inference_positions, cache_interval=cache_interval, progressive_inference=True, noise_level=0.5, original_shape=input_slice.shape, patch_ref=full_inference_patches.half())
+                assert len(patch_ref[patch_ids]) == len(progressive_inference_patches)
+                # pdb.set_trace()
+                # evaluate_image_quality(patch_ref[patch_ids].cpu().numpy(), progressive_inference_patches.cpu().numpy())
+                progressive_results, _ = patch_inference(model, device, scheduler, progressive_inference_patches, progressive_inference_positions, cache_interval=cache_interval, progressive_inference=True, noise_level=0.8, original_shape=input_slice.shape, patch_ref=patch_ref[patch_ids])
+                ensemble_results = combine_inference_results(full_results, progressive_results, full_inference_positions, progressive_inference_positions, patch_size)                
                 # cache_output = deepcache_inference(model, device, scheduler, input_slice, inference_step=inference_step, cache_interval=cache_interval, cache_branch_id=cache_branch_id, use_half=use_half)
-                cache_outputs.append(cache_output.detach().cpu())
+                # full_inference_patches, progressive_inference_patches, full_inference_positions, progressive_inference_positions = parselate_with_lpips(input_slice, patch_size, overlap=32, patch_num=target_patches, lpips_threshold=0.01, positions=None, overlap_map=None, cache_depth=2, device='cuda')
+                # full_results, patch_ref = patch_inference(model, device, scheduler, full_inference_patches, full_inference_positions, cache_interval=cache_interval, progressive_inference=False, original_shape=input_slice.shape)
+                
+                # evaluate_image_quality(orig_slice.cpu().numpy(), ensemble_results.cpu().numpy())
+                
+                for i in range(len(ensemble_results)):
+                    vis = torch.hstack((orig_slice[i].cpu().squeeze(), input_slice[i].cpu().squeeze(), ensemble_results[i].cpu().squeeze()))
+                    torchvision.utils.save_image(vis, f'{idx}_{i}.png')
+                
+                
+                cache_outputs.append(ensemble_results.detach().cpu())
                 gpu_memory_tracker()
+            
             cache_output = torch.clamp(torch.nan_to_num(torch.stack(cache_outputs).mean(0)), 0, 1)
             cache_outputs = []
             
             final_outputs.extend(cache_output)
+            
+                
             orig_inputs.extend(orig_slice.detach().cpu().numpy())
             input_slices.extend(torch.rot90(input_slice.detach().cpu(), k=-1, dims=(2, 3)))
 
@@ -1707,21 +2331,21 @@ def main():
         final_outputs_dimensions.append(final_outputs)
 
     
-
+    
     final_outputs = np.stack(final_outputs_dimensions).mean(0)
     
     input_slices = torch.tensor(np.squeeze(np.stack(input_slices))).permute(1,-1,0).numpy()
-
-    cache_metrics = evaluate_image_quality(final_outputs.transpose(-1,0,1)[:,None,...], data.cpu().numpy().transpose(-1,0,1)[:,None,...])
-
     pdb.set_trace()
+    cache_metrics = evaluate_image_quality(final_outputs.transpose(-1,0,1)[:,None,...], data.cpu().numpy().transpose(-1,0,1)[:,None,...])
+    
+
     data = tio.transforms.CropOrPad(input_nii.shape)(data.unsqueeze(0).cpu().numpy()).squeeze()
     final_outputs = tio.transforms.CropOrPad(input_nii.shape)(final_outputs[None]).squeeze()
     input_slices = tio.transforms.CropOrPad(input_nii.shape)(input_slices[None]).squeeze()
 
     
-    nib.save(nib.Nifti1Image(np.round(final_outputs * 1000), affine=input_nii.affine), 'cache_output.nii.gz')
-    nib.save(nib.Nifti1Image(data.cpu().numpy(), affine=input_nii.affine), 'cache_input.nii.gz')
+    nib.save(nib.Nifti1Image(np.round(final_outputs * 1000), affine=input_nii.affine), './3dFWHMx/cache_output.nii.gz')
+    nib.save(nib.Nifti1Image(data, affine=input_nii.affine), 'cache_input.nii.gz')
     nib.save(nib.Nifti1Image(input_slices, affine=input_nii.affine), 'lowres_1.57mm.nii.gz')
     
 if __name__ == "__main__":

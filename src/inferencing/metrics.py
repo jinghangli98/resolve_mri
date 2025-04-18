@@ -5,7 +5,7 @@ import lpips
 import torch
 import pdb
 
-def calculate_lpips(generated, target):
+def calculate_lpips(generated, target, return_mean=True, device='cpu'):
     """
     Calculate LPIPS between generated and target images
     
@@ -16,7 +16,7 @@ def calculate_lpips(generated, target):
     Returns:
         Mean LPIPS value across the batch
     """
-    loss_fn = lpips.LPIPS(net='vgg')
+    loss_fn = lpips.LPIPS(net='vgg').to(device)
     
     # Convert to tensor if not already
     if not isinstance(generated, torch.Tensor):
@@ -54,9 +54,12 @@ def calculate_lpips(generated, target):
         lpips_value = loss_fn(generated[i:i+1], target[i:i+1]).item()
         lpips_values.append(lpips_value)
     
-    return np.mean(lpips_values)
+    if return_mean:
+        return np.mean(lpips_values)
+    
+    return lpips_values
 
-def calculate_ssim(generated, target):
+def calculate_ssim(generated, target, return_mean=True):
     """
     Calculate SSIM between generated and target images
     
@@ -94,7 +97,10 @@ def calculate_ssim(generated, target):
             ssim_val = ssim(gen_slice, target_slice, data_range=data_range)
             ssim_values.append(ssim_val)
     
-    return np.mean(ssim_values)
+    if return_mean:
+        return np.mean(ssim_values)
+    else:
+        return ssim_values
 
 def calculate_psnr(generated, target):
     """

@@ -21,6 +21,7 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Optional, Union
 import time
 from itertools import chain
+import argparse
 
 def crop_mri_volume(data, threshold=0.01, padding=1, divisible_by=16):
     """
@@ -168,7 +169,7 @@ def gpu_memory_tracker(
 class VolumeDataset(Dataset):
     """Dataset for 3D volume data"""
     
-    def __init__(self, volume_array, dimension, transform=None):
+    def __init__(self, volume_array, dimension, scale_factor, transform=None):
         """
         Args:
             volume_array (numpy.ndarray): 3D volume data of shape (D, H, W)
@@ -177,6 +178,8 @@ class VolumeDataset(Dataset):
         self.volume = volume_array
         self.transform = transform
         self.dimension = dimension
+        self.scale_factor = scale_factor
+
         if self.dimension == 'axial':
             self.depth = volume_array.shape[-1]
         elif self.dimension == 'coronal':
@@ -205,7 +208,7 @@ class VolumeDataset(Dataset):
         
         if self.transform:
             slice_tensor = self.transform(slice_tensor)
-        slice_tensor = downsample_upsample(slice_tensor.unsqueeze(0), scale_factor=0.99, mode='bilinear')
+        slice_tensor = downsample_upsample(slice_tensor.unsqueeze(0), scale_factor=self.scale_factor, mode='bilinear')
         
         return slice_tensor.squeeze(0), slice_tensor_original
 
@@ -223,26 +226,6 @@ def plot_patch_heatmap(image, positions, overlap_map):
     ax2.imshow(overlap_map, cmap='hot')
     ax2.set_title("Overlap Density (Hot = More Overlap)")
     plt.savefig('adaptive_patch_heatmap.png')
-    
-def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int, max_period: int = 10000) -> torch.Tensor:
-    """
-    Create sinusoidal timestep embeddings.
-    """
-    if timesteps.ndim != 1:
-        raise ValueError("Timesteps should be a 1d-array")
-
-    half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
-    freqs = torch.exp(exponent / half_dim)
-
-    args = timesteps[:, None].float() * freqs[None, :]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-
-    # zero pad
-    if embedding_dim % 2 == 1:
-        embedding = torch.nn.functional.pad(embedding, (0, 1, 0, 0))
-
-    return embedding
 
 class MonaiDeepCache:
     """
@@ -388,373 +371,6 @@ class MonaiDeepCache:
         self.cached_features = {}
         self.step_counter = 0
 
-class MonaiAdaptiveDeepCache:
-    """
-    AdaCache-inspired implementation for MONAI UNet that supports caching across
-    images within a batch, with an adaptive caching schedule based on similarity.
-    """
-    def __init__(self, model, cache_interval=5, cache_branch_id=0, similarity_threshold=0.85):
-        """
-        Initialize AdaptiveDeepCache for a MONAI diffusion model.
-        
-        Args:
-            model: MONAI diffusion model
-            cache_interval: Initial/default cache interval
-            cache_branch_id: Which branch to use for caching (0=shallowest, higher=deeper)
-            similarity_threshold: Threshold to determine when to recompute vs. reuse cache
-        """
-        self.model = model
-        self.cache_interval = cache_interval
-        self.cache_branch_id = cache_branch_id
-        self.similarity_threshold = similarity_threshold
-        
-        # Cache storage
-        self.cached_features = {}
-        self.cached_features_by_img = {}
-        self.step_counter = 0
-        self.enabled = False
-        
-        # Batch tracking
-        self.batch_size = None
-        self.similarity_matrix = None
-        
-        # Adaptive caching
-        self.distance_metrics = {}
-        self.caching_schedule = {}
-        self.codebook = {
-            0.05: 12, 0.10: 8, 0.15: 6, 0.20: 4, 0.30: 2, 1.00: 1
-        }
-        
-        # Store original forward methods
-        self.original_down_forward = {}
-        self.original_middle_forward = None
-        self.original_up_forward = {}
-        
-        # Track execution state
-        self.current_down_idx = 0
-        self.is_up_phase = False
-        self.current_up_idx = 0
-        
-    def setup_batch(self, batch_input):
-        """
-        Setup caching for a new batch of images.
-        
-        Args:
-            batch_input: The current batch input tensor [B, C, H, W]
-        """
-        self.batch_size = batch_input.shape[0]
-        self.cached_features_by_img = {}
-        
-        # Compute feature representation for each image in the batch
-        with torch.no_grad():
-            # Simple feature extraction
-            img_repr = batch_input.mean(dim=(2, 3))[:, :min(16, batch_input.shape[1])]
-            
-            # Compute similarity matrix between all images in the batch
-            img_repr_norm = img_repr / (torch.norm(img_repr, dim=1, keepdim=True) + 1e-8)
-            self.similarity_matrix = torch.mm(img_repr_norm, img_repr_norm.transpose(0, 1))
-            
-        # Initialize adaptive caching parameters for each image
-        self.distance_metrics = {i: {} for i in range(self.batch_size)}
-        self.caching_schedule = {i: self.cache_interval for i in range(self.batch_size)}
-            
-    def compute_distance_metric(self, features_current, features_cached):
-        """
-        Calculate L1 distance between feature maps.
-        
-        Args:
-            features_current: Current feature output (may be a tuple for down blocks)
-            features_cached: Cached feature output (may be a tuple for down blocks)
-            
-        Returns:
-            Distance metric (float)
-        """
-        with torch.no_grad():
-            # Handle tuple output case (downsample blocks return (output, residual))
-            if isinstance(features_current, tuple) and isinstance(features_cached, tuple):
-                # Just compare the main output (first element of the tuple)
-                main_current = features_current[0]
-                main_cached = features_cached[0]
-                return torch.abs(main_current - main_cached).mean().item()
-            else:
-                # Standard case - direct comparison
-                return torch.abs(features_current - features_cached).mean().item()
-    
-    def update_caching_schedule(self, img_idx, layer_idx, current_features, cached_features):
-        """
-        Update the caching schedule based on feature distance.
-        
-        Args:
-            img_idx: Index of the image in the batch
-            layer_idx: Index of the layer
-            current_features: Current feature output
-            cached_features: Cached feature output
-        """
-        if cached_features is None:
-            return
-            
-        # Compute distance between current and cached features
-        distance = self.compute_distance_metric(current_features, cached_features)
-        self.distance_metrics[img_idx][layer_idx] = distance
-        
-        # Get average distance across all tracked layers for this image
-        if len(self.distance_metrics[img_idx]) > 0:
-            avg_distance = sum(self.distance_metrics[img_idx].values()) / len(self.distance_metrics[img_idx])
-            
-            # Update caching schedule based on distance
-            for threshold, rate in sorted(self.codebook.items()):
-                if avg_distance <= threshold:
-                    self.caching_schedule[img_idx] = rate
-                    break
-    
-    def enable(self):
-        """Enable AdaptiveDeepCache by replacing forward methods with patched versions"""
-        if self.enabled:
-            return
-            
-        # Store references to the original methods
-        self.original_middle_forward = self.model.middle_block.forward
-        
-        # Patch down blocks
-        for i, block in enumerate(self.model.down_blocks):
-            self.original_down_forward[i] = block.forward
-            
-            # Create closure to capture the block index
-            def create_down_patch(idx):
-                def patched_forward(hidden_states, temb, context=None):
-                    self.current_down_idx = idx
-                    
-                    # Skip caching logic for shallow blocks or non-batch processing
-                    if idx <= self.cache_branch_id or self.batch_size is None or self.batch_size <= 1:
-                        result = self.original_down_forward[idx](hidden_states, temb, context)
-                        if self.step_counter % self.cache_interval == 0:
-                            self.cached_features[f'down_{idx}'] = result
-                        return result
-                    
-                    # For batch processing with multiple images
-                    batch_chunks = []
-                    res_lists = []  # Each element will be a list of residual tensors
-                    
-                    for img_idx in range(self.batch_size):
-                        img_cache_key = f'down_{idx}_{img_idx}'
-                        img_input = hidden_states[img_idx:img_idx+1]
-                        img_temb = temb[img_idx:img_idx+1] if temb is not None else None
-                        img_context = context[img_idx:img_idx+1] if context is not None else None
-                        
-                        # Check if we should use cache for this image based on its adaptive schedule
-                        img_cache_interval = self.caching_schedule.get(img_idx, self.cache_interval)
-                        use_cache = (self.step_counter % img_cache_interval != 0 and 
-                                    img_cache_key in self.cached_features_by_img)
-                        
-                        if use_cache:
-                            # Use cached features for this image
-                            img_result = self.cached_features_by_img[img_cache_key]
-                            # Split into output and residual components
-                            img_output, img_residual = img_result
-                        else:
-                            # Compute new features for this image
-                            img_output, img_residual = self.original_down_forward[idx](img_input, img_temb, img_context)
-                            img_result = (img_output, img_residual)
-                            
-                            # Cache the result
-                            self.cached_features_by_img[img_cache_key] = img_result
-                            
-                            # Update caching schedule for next time if we have previous results
-                            if img_cache_key in self.cached_features_by_img:
-                                self.update_caching_schedule(
-                                    img_idx, idx, img_result, 
-                                    self.cached_features_by_img[img_cache_key]
-                                )
-                        
-                        # Collect results for later concatenation
-                        batch_chunks.append(img_output)
-                        res_lists.append(img_residual)  # This is already a list of tensors
-                    
-                    # Concatenate results back into a batch
-                    output = torch.cat(batch_chunks, dim=0)
-                    
-                    # Handle residuals - they are lists of tensors
-                    # We need to concatenate corresponding tensors across all images
-                    combined_residuals = []
-                    if len(res_lists) > 0 and isinstance(res_lists[0], list):
-                        # Determine how many residual tensors we have per image
-                        num_residuals = len(res_lists[0])
-                        
-                        # For each position in the residual list
-                        for res_idx in range(num_residuals):
-                            # Collect the residual tensor at this position from each image
-                            res_at_idx = [res_list[res_idx] for res_list in res_lists]
-                            # Concatenate these tensors
-                            combined_res = torch.cat(res_at_idx, dim=0)
-                            combined_residuals.append(combined_res)
-                    else:
-                        # If residuals are not lists, concatenate them directly
-                        combined_residuals = torch.cat(res_lists, dim=0)
-                    
-                    result = (output, combined_residuals)
-                    
-                    # Also update global cache for backward compatibility
-                    if self.step_counter % self.cache_interval == 0:
-                        self.cached_features[f'down_{idx}'] = result
-                        
-                    return result
-                return patched_forward
-                
-            # Apply the patch
-            block.forward = create_down_patch(i)
-            
-        # Patch middle block
-        def patched_middle_forward(hidden_states, temb, context=None):
-            # Skip caching logic for non-batch processing
-            if self.batch_size is None or self.batch_size <= 1:
-                result = self.original_middle_forward(hidden_states, temb, context)
-                if self.step_counter % self.cache_interval == 0:
-                    self.cached_features['middle'] = result
-                return result
-            
-            # For batch processing with multiple images
-            batch_chunks = []
-            
-            for img_idx in range(self.batch_size):
-                img_cache_key = f'middle_{img_idx}'
-                img_input = hidden_states[img_idx:img_idx+1]
-                img_temb = temb[img_idx:img_idx+1] if temb is not None else None
-                img_context = context[img_idx:img_idx+1] if context is not None else None
-                
-                # Check if we should use cache based on adaptive schedule
-                img_cache_interval = self.caching_schedule.get(img_idx, self.cache_interval)
-                use_cache = (self.step_counter % img_cache_interval != 0 and 
-                              img_cache_key in self.cached_features_by_img)
-                
-                if use_cache:
-                    # Use cached features for this image
-                    img_result = self.cached_features_by_img[img_cache_key]
-                else:
-                    # Compute new features for this image
-                    img_result = self.original_middle_forward(img_input, img_temb, img_context)
-                    
-                    # Cache the result
-                    self.cached_features_by_img[img_cache_key] = img_result
-                    
-                    # Update caching schedule for next time
-                    if img_cache_key in self.cached_features_by_img:
-                        self.update_caching_schedule(
-                            img_idx, 0, img_result, 
-                            self.cached_features_by_img[img_cache_key]
-                        )
-                
-                batch_chunks.append(img_result)
-            
-            # Concatenate results back into a batch
-            result = torch.cat(batch_chunks, dim=0)
-            
-            # Also update global cache for backward compatibility
-            if self.step_counter % self.cache_interval == 0:
-                self.cached_features['middle'] = result
-                
-            return result
-            
-        # Apply the middle patch
-        self.model.middle_block.forward = patched_middle_forward
-        
-        # Patch up blocks
-        for i, block in enumerate(self.model.up_blocks):
-            self.original_up_forward[i] = block.forward
-            
-            def create_up_patch(idx):
-                def patched_forward(hidden_states, res_hidden_states_list, temb, context=None):
-                    self.is_up_phase = True
-                    self.current_up_idx = idx
-                    
-                    # Skip caching logic for shallow blocks or non-batch processing
-                    up_idx_from_end = len(self.model.up_blocks) - 1 - idx
-                    if up_idx_from_end <= self.cache_branch_id or self.batch_size is None or self.batch_size <= 1:
-                        result = self.original_up_forward[idx](hidden_states, res_hidden_states_list, temb, context)
-                        if self.step_counter % self.cache_interval == 0:
-                            self.cached_features[f'up_{idx}'] = result
-                        return result
-                    
-                    # For batch processing with multiple images
-                    batch_chunks = []
-                    
-                    for img_idx in range(self.batch_size):
-                        img_cache_key = f'up_{idx}_{img_idx}'
-                        img_input = hidden_states[img_idx:img_idx+1]
-                        img_res_list = [res[img_idx:img_idx+1] for res in res_hidden_states_list]
-                        img_temb = temb[img_idx:img_idx+1] if temb is not None else None
-                        img_context = context[img_idx:img_idx+1] if context is not None else None
-                        
-                        # Check if we should use cache based on adaptive schedule
-                        img_cache_interval = self.caching_schedule.get(img_idx, self.cache_interval)
-                        use_cache = (self.step_counter % img_cache_interval != 0 and 
-                                    img_cache_key in self.cached_features_by_img)
-                        
-                        if use_cache:
-                            # Use cached features for this image
-                            img_result = self.cached_features_by_img[img_cache_key]
-                        else:
-                            # Compute new features for this image
-                            img_result = self.original_up_forward[idx](img_input, img_res_list, img_temb, img_context)
-                            
-                            # Cache the result
-                            self.cached_features_by_img[img_cache_key] = img_result
-                            
-                            # Update caching schedule for next time
-                            if img_cache_key in self.cached_features_by_img:
-                                self.update_caching_schedule(
-                                    img_idx, idx + 100, img_result,  # Use idx+100 to differentiate from down blocks
-                                    self.cached_features_by_img[img_cache_key]
-                                )
-                        
-                        batch_chunks.append(img_result)
-                    
-                    # Concatenate results back into a batch
-                    result = torch.cat(batch_chunks, dim=0)
-                    
-                    # Also update global cache for backward compatibility
-                    if self.step_counter % self.cache_interval == 0:
-                        self.cached_features[f'up_{idx}'] = result
-                        
-                    return result
-                return patched_forward
-                
-            # Apply the patch
-            block.forward = create_up_patch(i)
-            
-        self.enabled = True
-    
-    def pre_step(self):
-        """Call before each denoising step"""
-        self.step_counter += 1
-        
-    def disable(self):
-        """Disable DeepCache by restoring original forward methods"""
-        if not self.enabled:
-            return
-            
-        # Restore original methods
-        self.model.middle_block.forward = self.original_middle_forward
-        
-        for i, block in enumerate(self.model.down_blocks):
-            if i in self.original_down_forward:
-                block.forward = self.original_down_forward[i]
-            
-        for i, block in enumerate(self.model.up_blocks):
-            if i in self.original_up_forward:
-                block.forward = self.original_up_forward[i]
-            
-        self.enabled = False
-        
-    def clear_cache(self):
-        """Clear all caches"""
-        self.cached_features = {}
-        self.cached_features_by_img = {}
-        self.distance_metrics = {}
-        self.caching_schedule = {}
-        self.similarity_matrix = None
-        self.batch_size = None
-        self.step_counter = 0
-
 def deepcache_inference(model, device, scheduler, t1w, inference_step=100, cache_interval=5, cache_branch_id=0, 
                         progressive_inference=False, noise_level=0.7, use_half=True):
     """
@@ -848,116 +464,6 @@ def deepcache_inference(model, device, scheduler, t1w, inference_step=100, cache
         # Always restore the original model
         deepcache.disable()
         
-def adaptive_deepcache_inference(model, device, scheduler, t1w, inference_step=100, 
-                                cache_interval=5, cache_branch_id=0, similarity_threshold=0.85,
-                                progressive_inference=False, noise_level=0.7, use_half=True):
-    """
-    Run inference with Adaptive DeepCache optimization for faster generation with batch-aware caching.
-    
-    Args:
-        model: The diffusion model
-        device: Device to run inference on
-        scheduler: Diffusion scheduler
-        t1w: Input batch of images [B, C, H, W]
-        cache_interval: Initial cache interval (will be adapted per image)
-        cache_branch_id: Which branch to use for caching (0=shallowest, higher=deeper)
-        similarity_threshold: Threshold to determine when to reuse cache between similar images
-        progressive_inference: Whether to use progressive inference
-        noise_level: Progressive inference noise level (0.0 to 1.0)
-        use_half: Whether to use half precision (FP16)
-    
-    Returns:
-        Generated batch of images
-    """
-    model.eval()
-    
-    # Initialize Adaptive DeepCache
-    adaptive_cache = MonaiAdaptiveDeepCache(
-        model, 
-        cache_interval=cache_interval, 
-        cache_branch_id=cache_branch_id,
-        similarity_threshold=similarity_threshold
-    )
-    
-    try:
-        adaptive_cache.enable()
-        
-        with torch.no_grad():
-            # Setup
-            input_img = t1w
-            
-            # Initialize adaptive caching for this batch
-            adaptive_cache.setup_batch(input_img)
-            
-            if use_half:
-                input_img = input_img.half()
-                
-            scheduler.set_timesteps(num_inference_steps=inference_step)
-            
-            # Initial setup for progressive inference if enabled
-            if progressive_inference:
-                current_img = input_img.clone()
-                noise_timestep = int(noise_level * len(scheduler.timesteps))
-                noise_timestep = max(min(noise_timestep, len(scheduler.timesteps)-1), 0)
-                noise = torch.randn_like(current_img, device=device)
-                if use_half:
-                    noise = noise.half()
-                    
-                t = scheduler.timesteps[noise_timestep]
-
-                alpha_cumprod = scheduler.alphas_cumprod.to(device)
-                if use_half:
-                    alpha_cumprod = alpha_cumprod.half()
-                    
-                sqrt_alpha_t = alpha_cumprod[t] ** 0.5
-                sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
-                current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
-                
-                starting_timestep_idx = noise_timestep
-                timesteps = scheduler.timesteps[starting_timestep_idx:]
-            else:
-                noise = torch.randn_like(input_img).to(device)
-                if use_half:
-                    noise = noise.half()
-                    
-                current_img = noise  # Start from random noise
-                timesteps = scheduler.timesteps
-            
-            # Main inference loop
-            batch_size = input_img.shape[0]
-            progress_bar = tqdm(timesteps, desc=f"Adaptive DeepCache Inferencing (Batch: {batch_size})")
-            
-            for t in progress_bar:
-                # Prepare for this step
-                adaptive_cache.pre_step()
-                
-                # Calculate average cache interval across all images in batch
-                avg_cache_interval = sum(adaptive_cache.caching_schedule.values()) / max(len(adaptive_cache.caching_schedule), 1)
-                
-                # Update progress bar with cache usage info
-                if adaptive_cache.step_counter % cache_interval == 0:
-                    progress_bar.set_postfix({"mode": "full", "avg_interval": f"{avg_cache_interval:.1f}"})
-                else:
-                    progress_bar.set_postfix({"mode": "cached", "avg_interval": f"{avg_cache_interval:.1f}"})
-                    
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_half):
-                    # Combine input and current noisy image
-                    combined = torch.cat((input_img, current_img), dim=1)
-                    
-                    # Expand timesteps for batch processing
-                    batch_timesteps = torch.Tensor((t,)).to(device).repeat(batch_size)
-                    
-                    # Run model with Adaptive DeepCache
-                    model_output = model(combined, timesteps=batch_timesteps)
-                    
-                    # Update the noisy image
-                    current_img, _ = scheduler.step(model_output, t, current_img)
-                    
-            return current_img
-    finally:
-        # Always restore the original model
-        adaptive_cache.disable()
-
 def load_model(checkpoint_path, device="cuda", use_xformers=True, use_half=True, torch_compile=True, channels_last=False):
     
     """Load the pretrained diffusion model with various acceleration options
@@ -1277,7 +783,7 @@ def create_covering_grid(H, W, patch_size, overlap):
     
     return positions
 
-def parselate_with_lpips(image, patch_size, overlap, patch_num, lpips_threshold=0.85, positions=None, overlap_map=None, cache_depth=2, device='cuda'):
+def parselate_with_lpips(image, patch_size, overlap, patch_num, ssim_threshold=0.85, positions=None, overlap_map=None, cache_depth=2, device='cuda'):
     """
     Parselate an image into patches with adaptive patch location selection and divide them into
     full inference and progressive inference based on LPIPS scores.
@@ -1287,12 +793,12 @@ def parselate_with_lpips(image, patch_size, overlap, patch_num, lpips_threshold=
         patch_size: Size of each patch (assumed square)
         overlap: Base overlap between patches
         patch_num: Target number of patches per image
-        lpips_threshold: Threshold for LPIPS score to determine inference method
+        ssim_threshold: Threshold for SSIM score to determine inference method
         positions: Optional pre-computed patch positions
         overlap_map: Optional pre-computed overlap map
         cache_depth: Number of consecutive batch items to share the same patch locations
                     (must divide batch size evenly)
-        device: Device to use for LPIPS calculation ('cuda' or 'cpu')
+        device: Device to use for SSIM calculation ('cpu')
         
     Returns:
         full_inference_patches: Tensor of patches for full inference
@@ -1374,8 +880,8 @@ def parselate_with_lpips(image, patch_size, overlap, patch_num, lpips_threshold=
                 lpips_score = torch.tensor(lpips_score, device=device)
             
             # Create masks for high and low similarity
-            high_dissimilarity_mask = lpips_score < lpips_threshold
-            low_dissimilarity_mask = lpips_score >= lpips_threshold
+            high_dissimilarity_mask = lpips_score < ssim_threshold
+            low_dissimilarity_mask = lpips_score >= ssim_threshold
             
             # Convert to boolean mask if needed
             if high_dissimilarity_mask.dtype != torch.bool:
@@ -1792,7 +1298,7 @@ def patch_inference(model, device, scheduler, patches, positions_info, original_
             noise = torch.randn_like(current_img, device=device)
             if use_half:
                 noise = noise.half()
-            
+
             t = scheduler.timesteps[noise_timestep]
             alpha_cumprod = scheduler.alphas_cumprod.to(device)
             if use_half:
@@ -1882,103 +1388,6 @@ def patch_inference(model, device, scheduler, patches, positions_info, original_
         # Always disable DeepCache if it was enabled
         if use_deepcache and deepcache is not None:
             deepcache.disable()
-
-def non_uniform_deepcache_inference(model, device, scheduler, t1w, 
-                                   center_timestep=400, power=1.2, cache_branch_id=0,
-                                   progressive_inference=False, noise_level=0.7):
-    """
-    DeepCache with non-uniform intervals as described in the paper.
-    This samples more frequently around critical timesteps.
-    
-    Args:
-        model: The diffusion model
-        device: Device to run inference on
-        scheduler: Diffusion scheduler
-        t1w: Input image
-        center_timestep: Timestep to center the non-uniform sampling around
-        power: Power for the quadratic increase in intervals
-        cache_branch_id: Which branch to use for caching
-        progressive_inference: Whether to use progressive inference
-        noise_level: Progressive inference noise level (0.0 to 1.0)
-    
-    Returns:
-        Generated image
-    """
-    model.eval()
-    
-    # Initialize DeepCache
-    deepcache = MonaiDeepCache(model, cache_interval=1, cache_branch_id=cache_branch_id)
-    deepcache.enable()
-    
-    try:
-        with torch.no_grad():
-            scheduler.set_timesteps(num_inference_steps=1000)
-            num_inference_steps = len(scheduler.timesteps)
-            
-            # Determine non-uniform caching steps
-            # Sample more densely around center_timestep
-            steps = np.arange(num_inference_steps)
-            distances = np.abs(steps - center_timestep)
-            # Quadratic increase in interval size as we move away from center
-            intervals = np.maximum(1, np.power(distances / 10, power)).astype(int)
-            
-            # Create list of steps where we'll do full inference
-            full_inference_steps = []
-            current_step = 0
-            while current_step < num_inference_steps:
-                full_inference_steps.append(current_step)
-                current_step += intervals[current_step]
-            
-            # Setup
-            input_img = t1w
-            
-            # Initial setup for progressive inference if enabled
-            if progressive_inference:
-                current_img = input_img.clone()
-                noise_timestep = int(noise_level * num_inference_steps)
-                noise_timestep = max(min(noise_timestep, num_inference_steps-1), 0)
-                noise = torch.randn_like(current_img, device=device)
-                t = scheduler.timesteps[noise_timestep]
-
-                alpha_cumprod = scheduler.alphas_cumprod.to(device)
-                sqrt_alpha_t = alpha_cumprod[t] ** 0.5
-                sqrt_one_minus_alpha_t = (1 - alpha_cumprod[t]) ** 0.5
-                current_img = sqrt_alpha_t * current_img + sqrt_one_minus_alpha_t * noise
-                
-                starting_timestep_idx = noise_timestep
-                timesteps = scheduler.timesteps[starting_timestep_idx:]
-            else:
-                noise = torch.randn_like(input_img).to(device)
-                current_img = noise
-                timesteps = scheduler.timesteps
-            
-            # Main inference loop
-            progress_bar = tqdm(enumerate(timesteps), total=len(timesteps), desc="Non-Uniform DeepCache")
-            
-            for step_idx, t in progress_bar:
-                # Determine if this is a step for full inference
-                is_caching_step = step_idx in full_inference_steps
-                deepcache.step_counter = 0 if is_caching_step else 1  # Force cache usage for non-caching steps
-                
-                # Update progress bar with mode
-                if is_caching_step:
-                    progress_bar.set_postfix({"mode": "full"})
-                else:
-                    progress_bar.set_postfix({"mode": "cached"})
-                
-                with autocast("cuda", enabled=True):
-                    combined = torch.cat((input_img, current_img), dim=1)
-                    
-                    # Run the model with DeepCache
-                    model_output = model(combined, timesteps=torch.Tensor((t,)).to(device))
-                    
-                    # Update the noisy image
-                    current_img, _ = scheduler.step(model_output, t, current_img)
-                        
-            return current_img
-    finally:
-        # Always restore the original model
-        deepcache.disable()
 
 def inference_patch_idx(full_inference_positions, progressive_inference_positions, inference_batch_id, cache_depth=2):
     """
@@ -2226,53 +1635,134 @@ def combine_inference_results(full_results, progressive_results, full_inference_
     
     return combined_results
 
+def parse_arguments():
+    """
+    Parse and validate all input arguments for the main function.
+    Returns a namespace object containing all parameters.
+    """
+    parser = argparse.ArgumentParser(description="MRI Denoising with Diffusion Models")
+    
+    # Model configuration
+    parser.add_argument('--checkpoint_path', type=str, 
+                       default="/ix3/tibrahim/jil202/cfg_gen/src/training/checkpoints/320/0.5/patch_data_aug_lpips_1_320_ssim_8.14.pt",
+                       help="Path to the pretrained model checkpoint")
+    parser.add_argument('--image_path', type=str,
+                       default='/ix3/tibrahim/jil202/cfg_gen/qc_image_nii/denoised_mp2rage/IBRA-BIO1/PRT170058/converted/MP2RAGE_UNI_Images/md_denoised_PRT170058_20180912172034.nii.gz', #md_12898_20230628104454.nii.gz, /ix3/tibrahim/jil202/cfg_gen/qc_image_nii/denoised_mp2rage/IBRA-BIO1/PRT170058/converted/MP2RAGE_UNI_Images/md_denoised_PRT170058_20180912172034.nii.gz
+                       help="Path to the input NIfTI image")
+    
+    # DeepCache parameters
+    parser.add_argument('--cache_interval', type=int, default=1,
+                       help="Cache interval value (higher means more speedup but potentially lower quality)")
+    parser.add_argument('--cache_branch_id', type=int, default=0,
+                       help="Branch ID (0=shallowest/fastest, higher=deeper/better quality)")
+    parser.add_argument('--cache_depth', type=int, default=4,
+                       help="Cache depth for progressive inference")
+    parser.add_argument('--ssim_threshold', type=float, default=0.99,
+                       help="ssim threshold for patch selection")
+    
+    # Patch parameters
+    parser.add_argument('--patch_size', type=int, default=128,
+                       help="Size of patches for processing")
+    parser.add_argument('--target_patches', type=int, default=None,
+                       help="Target number of patches")
+    parser.add_argument('--base_overlap', type=int, default=32,
+                       help="Base overlap between patches")
+    parser.add_argument('--scale_factor', type=float, default=0.5,
+                       help="scale_factor")
+    
+    # Scheduler parameters
+    parser.add_argument('--ddim', action='store_true', default=False,
+                       help="Use DDIM scheduler instead of DDPMScheduler")
+    parser.add_argument('--ddpm', action='store_true', default=False,
+                       help="Use DDPM scheduler instead of DDIMScheduler")
+    parser.add_argument('--inference_step', type=int, default=1000,
+                       help="Number of inference steps")
+    
+    # Processing parameters
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help="Batch size for processing")
+    
+    parser.add_argument('--dimensions', type=str, nargs='+', 
+                       default=['axial', 'sagittal', 'coronal'],
+                       help="Dimensions to process (axial, sagittal, coronal)")
+    
+    # Performance optimization flags
+    parser.add_argument('--use_xformers', action='store_true', default=True,
+                       help="Enable xformers for memory-efficient attention")
+    parser.add_argument('--no_xformers', dest='use_xformers', action='store_false',
+                       help="Disable xformers")
+    parser.add_argument('--use_half', action='store_true', default=True,
+                       help="Enable half precision (FP16)")
+    parser.add_argument('--no_half', dest='use_half', action='store_false',
+                       help="Disable half precision")
+    parser.add_argument('--use_model_compile', action='store_true', default=True,
+                       help="Enable model compilation (torch.compile)")
+    parser.add_argument('--channels_last', action='store_true', default=False,
+                       help="Use channels-last memory format")
+    
+    # Output options
+    parser.add_argument('--baseline', action='store_true', default=False,)
+    parser.add_argument('--output_dir', type=str, default='./outputs',
+                       help="Directory to save output files")
+    parser.add_argument('--save', action='store_true', default=False,
+                       help="Directory to save output files")
+    
+    args = parser.parse_args()
+      
+    if args.cache_interval < 1:
+        raise ValueError("cache_interval must be at least 1")
+    
+    if not 0 <= args.ssim_threshold <= 1:
+        raise ValueError("ssim_threshold must be between 0 and 1")
+    
+    if args.ddim and args.inference_step == 1000:
+        raise ValueError("DDIM requires fewer than 1000 inference steps")
+    
+    return args
+
 def main():
     import time
     # Configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # checkpoint_path = "/ix3/tibrahim/jil202/cfg_gen/src/training/checkpoints/320/0.5/anatomy_scheduler_False_lpips_1_320_ssim_8.46.pt" # 
-    checkpoint_path = "/ix3/tibrahim/jil202/cfg_gen/src/training/checkpoints/320/0.5/patch_data_aug_lpips_1_320_ssim_8.14.pt"
-    # checkpoint_path = "/ix3/tibrahim/jil202/cfg_gen/src/training/checkpoints/320/0.35/baseline_1.57mm_320_ssim_7.17.pt"
-    image_path = '/ix3/tibrahim/jil202/cfg_gen/qc_image_nii/denoised_mp2rage/IBRA-BIO1/PRT170058/converted/MP2RAGE_UNI_Images/md_denoised_PRT170058_20180912172034.nii.gz'
-    # image_path = 'undersampled.nii.gz'
+    args = parse_arguments()
+    checkpoint_path = args.checkpoint_path 
+    image_path = args.image_path
 
-    # DeepCache parameters to test
-    cache_interval = 4    # N value - higher means more speedup but potentially lower quality
-    cache_branch_id = 0   # Branch ID - 0=shallowest (fastest), higher=deeper (better quality)
-    lpips_threshold = 0.1 # LPIPS threshold for patch selection (higher means more patches for progressive inference)
-    patch_size = 128
-    image_size = 384
-    target_patches = 24
-    patch_num = (image_size//patch_size) ** 2
-    additional_patches = target_patches - patch_num
-    base_overlap = 24
-    batch_size = 8
-    inference_step = 20
+    cache_interval = args.cache_interval    # N value - higher means more speedup but potentially lower quality
+    cache_branch_id = args.cache_branch_id   # Branch ID - 0=shallowest (fastest), higher=deeper (better quality)
+    cache_depth = args.cache_depth           # Cache depth for progressive inference
+    ssim_threshold = args.ssim_threshold
+    patch_size = args.patch_size
+    target_patches = args.target_patches
+    base_overlap = args.base_overlap
+    batch_size = args.batch_size
+    inference_step = args.inference_step
     # Performance optimization settings
-    use_xformers = True   # Enable xformers for memory-efficient attention
-    use_half = True  # Enable half precision (FP16)
-    use_progressive = False
-    use_model_compile = True
-    channels_last = False
+    use_xformers = args.use_xformers   # Enable xformers for memory-efficient attention
+    use_half = args.use_half  # Enable half precision (FP16)
+    use_model_compile = args.use_model_compile  # Enable model compilation (torch.compile)
+    channels_last = args.channels_last
         
     # Load model with optimizations
     print("Loading model with xformers and half precision...")
     model = load_model(checkpoint_path, device="cuda", use_xformers=use_xformers, use_half=use_half, torch_compile=use_model_compile, channels_last=channels_last)
-    
+    if args.ddpm:
+        scheduler = DDPMScheduler(num_train_timesteps=1000)
+        inference_step = 1000
+    elif args.ddim:
+        scheduler = DDIMScheduler(num_train_timesteps=1000)
+        scheduler.set_timesteps(num_inference_steps=inference_step)
     # Load and preprocess example input (single slice for benchmarking)
     input_nii = nib.load(image_path)
     data = quantile_normalization(input_nii, lower_quantile=0.01, upper_quantile=0.99)
     data = crop_mri_volume(torch.tensor(data)).unsqueeze(0).to(device).squeeze()
     final_outputs_dimensions = []
 
-    for dimension in ['axial', 'sagittal', 'coronal']: #'sagittal', 'coronal'
-        dataset = VolumeDataset(data, dimension)
+    start_time = time.time()
+    for dimension in args.dimensions: 
+        dataset = VolumeDataset(data, dimension, scale_factor=args.scale_factor)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-        
-        # Initialize scheduler
-        # scheduler = DDPMScheduler(num_train_timesteps=1000)
-        scheduler = DDIMScheduler(num_train_timesteps=1000)
-        scheduler.set_timesteps(num_inference_steps=inference_step)
+    
         # Run benchmarks with optimizations
         print("\n--- Running inference benchmarks with xformers and half precision ---")
         cache_outputs = []
@@ -2281,41 +1771,36 @@ def main():
         input_slices = []
         
         for idx, batch_data in enumerate(tqdm(dataloader)):
-            # Select a single slice for testing
             input_slice = batch_data[0]
             orig_slice = batch_data[1]
             print(f"---------{dimension} | {idx}/{len(dataloader)}--------")
-            for _ in range(1):
-                gpu_memory_tracker()
-                full_inference_patches, progressive_inference_patches, full_inference_positions, progressive_inference_positions, patch_ids = parselate_with_lpips(input_slice, patch_size, overlap=32, patch_num=None, lpips_threshold=lpips_threshold, positions=None, overlap_map=None, cache_depth=4, device='cuda')      
-                # patch_ids = inference_patch_idx_all(full_inference_positions, progressive_inference_positions, cache_depth=2)       
-                print(f'{idx} | Progressive patches: {len(progressive_inference_patches)}, Full patches: {len(full_inference_patches)}, Patch ref: {len(patch_ids)}')
-                full_results, patch_ref = patch_inference(model, device, scheduler, full_inference_patches, full_inference_positions, cache_interval=cache_interval, progressive_inference=True, noise_level=0.5, original_shape=input_slice.shape, patch_ref=full_inference_patches.half())
-                assert len(patch_ref[patch_ids]) == len(progressive_inference_patches)
-                # pdb.set_trace()
-                # evaluate_image_quality(patch_ref[patch_ids].cpu().numpy(), progressive_inference_patches.cpu().numpy())
-                progressive_results, _ = patch_inference(model, device, scheduler, progressive_inference_patches, progressive_inference_positions, cache_interval=cache_interval, progressive_inference=True, noise_level=0.8, original_shape=input_slice.shape, patch_ref=patch_ref[patch_ids])
-                ensemble_results = combine_inference_results(full_results, progressive_results, full_inference_positions, progressive_inference_positions, patch_size)                
-                # cache_output = deepcache_inference(model, device, scheduler, input_slice, inference_step=inference_step, cache_interval=cache_interval, cache_branch_id=cache_branch_id, use_half=use_half)
-                # full_inference_patches, progressive_inference_patches, full_inference_positions, progressive_inference_positions = parselate_with_lpips(input_slice, patch_size, overlap=32, patch_num=target_patches, lpips_threshold=0.01, positions=None, overlap_map=None, cache_depth=2, device='cuda')
-                # full_results, patch_ref = patch_inference(model, device, scheduler, full_inference_patches, full_inference_positions, cache_interval=cache_interval, progressive_inference=False, original_shape=input_slice.shape)
-                
-                # evaluate_image_quality(orig_slice.cpu().numpy(), ensemble_results.cpu().numpy())
-                
-                for i in range(len(ensemble_results)):
-                    vis = torch.hstack((orig_slice[i].cpu().squeeze(), input_slice[i].cpu().squeeze(), ensemble_results[i].cpu().squeeze()))
-                    torchvision.utils.save_image(vis, f'{idx}_{i}.png')
-                
-                
-                cache_outputs.append(ensemble_results.detach().cpu())
-                gpu_memory_tracker()
+            for _ in range(2):
+                if args.baseline:
+                    gpu_memory_tracker()
+                    cache_output = deepcache_inference(model, device, scheduler, input_slice, progressive_inference=True, noise_level=0.5, inference_step=inference_step, cache_interval=cache_interval, cache_branch_id=cache_branch_id, use_half=use_half)
+                    cache_outputs.append(cache_output.detach().cpu())
+                    gpu_memory_tracker()
+                else:
+                    gpu_memory_tracker()
+                    full_inference_patches, progressive_inference_patches, full_inference_positions, progressive_inference_positions, patch_ids = parselate_with_lpips(input_slice, patch_size, overlap=base_overlap, patch_num=target_patches, ssim_threshold=ssim_threshold, positions=None, overlap_map=None, cache_depth=cache_depth, device='cuda')      
+                    print(f'{idx} | Progressive patches: {len(progressive_inference_patches)}, Full patches: {len(full_inference_patches)}, Patch ref: {len(patch_ids)}')
+                    full_results, patch_ref = patch_inference(model, device, scheduler, full_inference_patches, full_inference_positions, cache_interval=cache_interval, cache_branch_id=cache_branch_id, progressive_inference=True, noise_level=0.5, original_shape=input_slice.shape, patch_ref=full_inference_patches.half())
+                    assert len(patch_ref[patch_ids]) == len(progressive_inference_patches)
+                    progressive_results, _ = patch_inference(model, device, scheduler, progressive_inference_patches, progressive_inference_positions, cache_interval=cache_interval, progressive_inference=True, noise_level=0.8, original_shape=input_slice.shape, patch_ref=patch_ref[patch_ids])
+                    ensemble_results = combine_inference_results(full_results, progressive_results, full_inference_positions, progressive_inference_positions, patch_size)                
+                    # cache_output = deepcache_inference(model, device, scheduler, input_slice, inference_step=inference_step, cache_interval=cache_interval, cache_branch_id=cache_branch_id, use_half=use_half)
+                    # full_inference_patches, progressive_inference_patches, full_inference_positions, progressive_inference_positions = parselate_with_lpips(input_slice, patch_size, overlap=32, patch_num=target_patches, lpips_threshold=0.01, positions=None, overlap_map=None, cache_depth=2, device='cuda')
+                    # full_results, patch_ref = patch_inference(model, device, scheduler, full_inference_patches, full_inference_positions, cache_interval=cache_interval, progressive_inference=False, original_shape=input_slice.shape)
+                    # evaluate_image_quality(orig_slice.cpu().numpy(), ensemble_results.cpu().numpy())
+                    cache_outputs.append(ensemble_results.detach().cpu())
+                    gpu_memory_tracker()
             
             cache_output = torch.clamp(torch.nan_to_num(torch.stack(cache_outputs).mean(0)), 0, 1)
             cache_outputs = []
             
             final_outputs.extend(cache_output)
             
-                
+            
             orig_inputs.extend(orig_slice.detach().cpu().numpy())
             input_slices.extend(torch.rot90(input_slice.detach().cpu(), k=-1, dims=(2, 3)))
 
@@ -2330,23 +1815,26 @@ def main():
 
         final_outputs_dimensions.append(final_outputs)
 
-    
-    
+    elapsed_time = time.time() - start_time
+
     final_outputs = np.stack(final_outputs_dimensions).mean(0)
     
     input_slices = torch.tensor(np.squeeze(np.stack(input_slices))).permute(1,-1,0).numpy()
-    pdb.set_trace()
     cache_metrics = evaluate_image_quality(final_outputs.transpose(-1,0,1)[:,None,...], data.cpu().numpy().transpose(-1,0,1)[:,None,...])
-    
+    print(f'Time passed: {elapsed_time:.2f} seconds')
+    print(f'SSIM: {args.ssim_threshold}, cache_depth: {args.cache_depth}, inference_step: {args.inference_step}')
+    print(cache_metrics)
 
-    data = tio.transforms.CropOrPad(input_nii.shape)(data.unsqueeze(0).cpu().numpy()).squeeze()
-    final_outputs = tio.transforms.CropOrPad(input_nii.shape)(final_outputs[None]).squeeze()
-    input_slices = tio.transforms.CropOrPad(input_nii.shape)(input_slices[None]).squeeze()
+    if args.save:
+        data = tio.transforms.CropOrPad(input_nii.shape)(final_outputs[None]).squeeze()
+        nib.save(nib.Nifti1Image(data, affine=input_nii.affine), f'cached_output.nii.gz')
+    # final_outputs = tio.transforms.CropOrPad(input_nii.shape)(final_outputs[None]).squeeze()
+    # input_slices = tio.transforms.CropOrPad(input_nii.shape)(input_slices[None]).squeeze()
 
     
-    nib.save(nib.Nifti1Image(np.round(final_outputs * 1000), affine=input_nii.affine), './3dFWHMx/cache_output.nii.gz')
-    nib.save(nib.Nifti1Image(data, affine=input_nii.affine), 'cache_input.nii.gz')
-    nib.save(nib.Nifti1Image(input_slices, affine=input_nii.affine), 'lowres_1.57mm.nii.gz')
+    # nib.save(nib.Nifti1Image(np.round(final_outputs * 1000), affine=input_nii.affine), './3dFWHMx/cache_output.nii.gz')
+    # nib.save(nib.Nifti1Image(data, affine=input_nii.affine), 'cache_input.nii.gz')
+    # nib.save(nib.Nifti1Image(input_slices, affine=input_nii.affine), 'lowres_1.57mm.nii.gz')
     
 if __name__ == "__main__":
     main()
